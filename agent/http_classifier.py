@@ -1,10 +1,13 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Set
 from urllib.parse import urlparse, urlsplit
 
-from agent.verification_policy import build_signal_metadata
+from agent.http.disclosure_enrichment import build_detector_disclosure_signals
+from agent.http.http_policy_classifier import build_policy_signals as _build_policy_signal_bundle
+from agent.http.http_signal_builder import build_signal as _build_signal
+from agent.http.http_signal_postprocessing import finalize_http_signals
 from agent.common import log
 
 
@@ -32,10 +35,6 @@ def _is_host_root_url(url: str) -> bool:
 def _first(items: List[str]) -> str:
     vals = _dedup(items)
     return vals[0] if vals else ""
-
-
-def _compact(items: List[str], limit: int = 4) -> List[str]:
-    return _dedup(items)[:limit]
 
 
 def _severity_rank(sev: str) -> int:
@@ -191,7 +190,7 @@ def _looks_like_generic_notfound_template(snapshot: Dict[str, Any], feats: Dict[
     generic_markers = [
         "page not found",
         "not found",
-        "페이지를 찾을 수가 없습니다",
+        "page could not be found",
         "the requested url was not found",
         "requested resource",
         "this system is strictly restricted to authorized users only",
@@ -204,7 +203,7 @@ def _looks_like_generic_notfound_template(snapshot: Dict[str, Any], feats: Dict[
     if (
         "<html" in body_l
         and "<title>page not found" in body_l
-        and "페이지를 찾을 수가 없습니다" in body_l
+        and "page could not be found" in body_l
     ):
         return True
 
@@ -710,7 +709,7 @@ def _build_config_exposure_signal(
             finding_type="HTTP_CONFIG_FILE_EXPOSURE",
             family="HTTP_BODY_DISCLOSURE",
             subtype="exposed_config_file",
-            title="설정 파일 내용이 HTTP로 노출됨",
+            title="Configuration Content Exposed Over HTTP",
             severity=severity,
             confidence=confidence,
             where="response.body",
@@ -767,7 +766,7 @@ def _is_sensitive_cookie_name(name: str) -> bool:
     if not n:
         return False
 
-    # 명확한 세션 / 인증 / CSRF 쿠키 우선
+    # Prefer clearly session, authentication, and CSRF-related cookie names first.
     strong_exact = {
         "jsessionid",
         "phpsessid",
@@ -791,7 +790,7 @@ def _is_sensitive_cookie_name(name: str) -> bool:
     if n in strong_exact:
         return True
 
-    # 이름 전체에 강한 민감 토큰이 포함된 경우만 허용
+    # Treat a cookie as sensitive only when the full name contains a strong sensitive token.
     strong_contains = (
         "jsession",
         "phpsess",
@@ -818,7 +817,7 @@ def _is_probably_non_sensitive_cookie_name(name: str) -> bool:
     if not n:
         return True
 
-    # 일반 환경에서 흔한 비민감/보조/UX 쿠키
+    # Common non-sensitive helper or UX cookies often seen in normal deployments.
     exact_names = {
         "lang",
         "language",
@@ -868,248 +867,6 @@ def _is_probably_non_sensitive_cookie_name(name: str) -> bool:
 
 
 
-
-
-def _signal_meta_for(family: str, subtype: str) -> Dict[str, str]:
-    if family == "TRANSPORT_SECURITY":
-        return build_signal_metadata(
-            signal_strength="deterministic",
-            signal_repeatability="stable",
-            observation_scope="transport_policy",
-        )
-
-    if family == "COOKIE_SECURITY":
-        return build_signal_metadata(
-            signal_strength="deterministic",
-            signal_repeatability="stable",
-            observation_scope="cookie_policy",
-        )
-
-    if family == "HTTP_HEADER_DISCLOSURE":
-        return build_signal_metadata(
-            signal_strength="deterministic",
-            signal_repeatability="stable",
-            observation_scope="response_policy",
-        )
-
-    if family == "HTTP_HEADER_SECURITY":
-        return build_signal_metadata(
-            signal_strength="deterministic",
-            signal_repeatability="stable",
-            observation_scope="response_policy",
-        )
-
-    if family == "HTTP_METHOD_SECURITY" and subtype == "risky_methods_enabled":
-        return build_signal_metadata(
-            signal_strength="deterministic",
-            signal_repeatability="stable",
-            observation_scope="response_policy",
-        )
-
-    if family == "HTTP_METHOD_SECURITY" and subtype == "trace_reflection":
-        return build_signal_metadata(
-            signal_strength="strong",
-            signal_repeatability="likely_stable",
-            observation_scope="request_specific",
-        )
-
-    if family == "CORS_MISCONFIG":
-        return build_signal_metadata(
-            signal_strength="strong",
-            signal_repeatability="likely_stable",
-            observation_scope="request_specific",
-        )
-
-    if family in {"HTTP_ERROR_DISCLOSURE", "HTTP_BODY_DISCLOSURE"}:
-        return build_signal_metadata(
-            signal_strength="strong",
-            signal_repeatability="likely_stable",
-            observation_scope="route_behavior",
-        )
-
-    if family in {"DIRECTORY_LISTING", "DEFAULT_RESOURCE_EXPOSURE"}:
-        return build_signal_metadata(
-            signal_strength="strong",
-            signal_repeatability="likely_stable",
-            observation_scope="route_behavior",
-        )
-
-    return build_signal_metadata(
-        signal_strength="weak",
-        signal_repeatability="unknown",
-        observation_scope="request_specific",
-    )
-
-
-def _alignment_meta_for(finding_type: str) -> Dict[str, Any]:
-    burp_zap_aligned_types = {
-        "HSTS_MISSING",
-        "COOKIE_HTTPONLY_MISSING",
-        "COOKIE_SECURE_MISSING",
-        "COOKIE_SAMESITE_MISSING",
-        "TRACE_ENABLED",
-        "RISKY_HTTP_METHODS_ENABLED",
-        "CORS_MISCONFIG",
-        "DIRECTORY_LISTING_ENABLED",
-        "DEFAULT_FILE_EXPOSED",
-        "HTTP_ERROR_INFO_EXPOSURE",
-        "HTTP_SYSTEM_INFO_EXPOSURE",
-        "PHPINFO_EXPOSURE",
-        "HTTP_CONFIG_FILE_EXPOSURE",
-        "LOG_VIEWER_EXPOSURE",
-        "FILE_PATH_HANDLING_ANOMALY",
-        "CLICKJACKING",
-        "CSP_MISSING",
-        "CONTENT_TYPE_SNIFFING",
-        "REFERRER_POLICY_MISSING",
-        "PERMISSIONS_POLICY_MISSING",
-    }
-
-    classification_kind = "finding"
-    if finding_type == "HTTPS_REDIRECT_MISSING":
-        classification_kind = "supporting_signal"
-
-    return {
-        "classification_kind": classification_kind,
-        "burp_zap_aligned": finding_type in burp_zap_aligned_types,
-    }
-
-
-def _why_and_rec(family: str) -> Dict[str, Any]:
-    mapping = {
-        "HTTP_HEADER_DISCLOSURE": {
-            "why": "응답 헤더가 서버/프레임워크 식별 정보를 노출하면 공격자의 정찰과 익스플로잇 선택을 돕는다.",
-            "rec": [
-                "불필요한 Server/X-Powered-By/Via 계열 헤더를 제거하거나 축소한다.",
-                "리버스 프록시, WAS, 프레임워크 레벨에서 배너 노출 정책을 정리한다.",
-            ],
-        },
-        "HTTP_ERROR_DISCLOSURE": {
-            "why": "에러 페이지가 스택트레이스, 파일경로, DB 오류 등을 노출하면 내부 구조가 드러난다.",
-            "rec": [
-                "운영 환경에서는 커스텀 에러 페이지를 사용하고 verbose 오류를 비활성화한다.",
-                "스택트레이스, 내부 경로, 예외 상세를 외부 응답에서 제거한다.",
-            ],
-        },
-        "HTTP_BODY_DISCLOSURE": {
-            "why": "본문의 제품 버전, 프레임워크 힌트, 디버그 정보는 공격자 정찰에 유용하다.",
-            "rec": [
-                "응답 본문에서 제품/버전/디버그 정보를 제거한다.",
-                "운영 환경에서 프레임워크 시그니처 노출을 줄인다.",
-            ],
-        },
-        "COOKIE_SECURITY": {
-            "why": "쿠키 속성이 약하면 브라우저 측 보호가 약화된다.",
-            "rec": [
-                "민감 쿠키에는 HttpOnly, Secure, SameSite를 적절히 설정한다.",
-                "세션/인증 쿠키부터 우선 점검한다.",
-            ],
-        },
-        "CORS_MISCONFIG": {
-            "why": "과도한 CORS 허용은 공격자 Origin에서 사용자 브라우저를 통해 응답을 읽게 만들 수 있다.",
-            "rec": [
-                "임의 Origin 반사를 금지한다.",
-                "credentials 사용 시 엄격한 allowlist를 적용한다.",
-            ],
-        },
-        "HTTP_METHOD_SECURITY": {
-            "why": "불필요하거나 위험한 HTTP 메서드는 공격면을 넓힌다.",
-            "rec": [
-                "필요한 메서드만 허용한다.",
-                "TRACE 등 불필요한 메서드를 웹서버/프록시/앱 전 구간에서 비활성화한다.",
-            ],
-        },
-        "TRANSPORT_SECURITY": {
-            "why": "전송 보안이 약하면 다운그레이드, 도청, 혼합 접속 위험이 생긴다.",
-            "rec": [
-                "HTTP를 HTTPS로 일관되게 리다이렉트한다.",
-                "HTTPS 응답에 HSTS를 설정한다.",
-            ],
-        },
-        "DEFAULT_RESOURCE_EXPOSURE": {
-            "why": "기본 파일, 디버그 엔드포인트, 저장소 메타데이터 노출은 민감 정보와 운영 구조를 드러낼 수 있다.",
-            "rec": [
-                "기본/디버그/운영 파일의 외부 노출을 제거한다.",
-                "배포 산출물에 민감 파일이 포함되지 않도록 점검한다.",
-            ],
-        },
-        "DIRECTORY_LISTING": {
-            "why": "디렉터리 listing은 파일명과 구조를 노출해 추가 탐색을 쉽게 만든다.",
-            "rec": [
-                "디렉터리 listing을 비활성화한다.",
-                "디렉터리 경로에는 generic 403/404를 반환한다.",
-            ],
-        },
-        "HTTP_HEADER_SECURITY": {
-            "why": "브라우저 보안 헤더 부재는 클릭재킹, MIME sniffing, referrer leakage 등의 노출을 키운다.",
-            "rec": [
-                "외부 노출 HTML 응답에 대한 표준 보안 헤더 baseline을 정의한다.",
-                "앱 전반에 동일 정책을 일관되게 적용한다.",
-            ],
-        },
-    }
-    return mapping.get(
-        family,
-        {
-            "why": "관찰된 HTTP 동작이 정보 노출 또는 보안 설정 미흡을 시사한다.",
-            "rec": ["운영 환경에서 불필요한 노출을 제거한다."],
-        },
-    )
-
-
-def _build_signal(
-    *,
-    signal_type: str,
-    finding_type: str,
-    family: str,
-    subtype: str,
-    title: str,
-    severity: str,
-    confidence: float,
-    where: str,
-    evidence: Dict[str, Any],
-    exposed_information: List[str],
-    leak_type: str,
-    leak_value: str,
-    cwe: str | None,
-    owasp: str,
-    scope_hint: str,
-    policy_object: str,
-    root_cause_signature: str,
-    technology_fingerprint: List[str],
-    template_fingerprint: str | None = None,
-    cwe_mapping_status: str | None = None,
-    cwe_mapping_reason: str | None = None,
-) -> Dict[str, Any]:
-    why_rec = _why_and_rec(family)
-    out = {
-        "signal_type": signal_type,
-        "finding_type": finding_type,
-        "family": family,
-        "subtype": subtype,
-        "title": title,
-        "severity": severity,
-        "confidence": confidence,
-        "where": where,
-        "evidence": evidence,
-        "exposed_information": _compact(exposed_information),
-        "leak_type": leak_type,
-        "leak_value": leak_value,
-        "cwe": cwe,
-        "owasp": owasp,
-        "scope_hint": scope_hint,
-        "policy_object": policy_object,
-        "root_cause_signature": root_cause_signature,
-        "technology_fingerprint": technology_fingerprint,
-        "template_fingerprint": template_fingerprint,
-        "why_it_matters": why_rec["why"],
-        "recommendation": why_rec["rec"],
-        "cwe_mapping_status": cwe_mapping_status,
-        "cwe_mapping_reason": cwe_mapping_reason,
-        **_signal_meta_for(family, subtype),
-        **_alignment_meta_for(finding_type),
-    }
-    return {k: v for k, v in out.items() if v not in (None, "", [], {})}
 
 
 def _build_header_disclosure_signals(
@@ -1235,11 +992,11 @@ def _build_header_disclosure_signals(
         severity, confidence = _header_severity_confidence(subtype, has_version, value)
 
         title_map = {
-            "server_header": "Server 헤더가 시스템 정보를 노출함",
-            "x_powered_by": "X-Powered-By 헤더가 시스템 정보를 노출함",
-            "via_header": "Via 헤더가 시스템 정보를 노출함",
-            "x_aspnet_version": "X-AspNet-Version 헤더가 시스템 정보를 노출함",
-            "x_aspnetmvc_version": "X-AspNetMvc-Version 헤더가 시스템 정보를 노출함",
+            "server_header": "Server Header Exposes System Information",
+            "x_powered_by": "X-Powered-By Header Exposes System Information",
+            "via_header": "Via Header Exposes System Information",
+            "x_aspnet_version": "X-AspNet-Version Header Exposes System Information",
+            "x_aspnetmvc_version": "X-AspNetMvc-Version Header Exposes System Information",
         }
 
         out.append(
@@ -1248,7 +1005,7 @@ def _build_header_disclosure_signals(
                 finding_type="HTTP_SYSTEM_INFO_EXPOSURE",
                 family="HTTP_HEADER_DISCLOSURE",
                 subtype=subtype,
-                title=title_map.get(subtype, "응답 헤더가 시스템 정보를 노출함"),
+                title=title_map.get(subtype, "Response Header Exposes System Information"),
                 severity=severity,
                 confidence=confidence,
                 where="response.headers",
@@ -1329,18 +1086,18 @@ def _build_error_disclosure_signals(
     medium_error_artifacts = bool(db_errors)
     debug_error_artifacts = bool(debug_hints or default_error_hint)
 
-    # generic 404/placeholder는 제외
+    # Exclude generic 404 or placeholder pages.
     if _looks_like_generic_notfound_template(snapshot, feats) and not strong_error_artifacts and not medium_error_artifacts:
         return out
 
-    # setup/install 문서는 매우 보수적으로
+    # Be conservative with setup or install documentation pages.
     if _looks_like_setup_or_install_page(final_url, body_text):
         if error_class not in {"stack_trace", "file_path"}:
             return out
 
-    # 핵심:
-    # 200 본문에서 phpinfo/config/default resource가 직접 보이는 경우
-    # 약한 db_error 계열로 다시 분류하지 않음
+    # Core rule:
+    # If phpinfo, config content, or a default resource is directly visible in a 200 response body,
+    # do not reclassify it as a weaker db_error finding.
     looks_like_concrete_resource_disclosure = bool(
         default_file_hints
         or (phpinfo_indicators and status_code == 200)
@@ -1352,11 +1109,11 @@ def _build_error_disclosure_signals(
         if not db_errors:
             return out
 
-        # 200 + 약한 db_error 단독은 버림
+        # Discard weak db_error-only signals on 200 responses.
         if status_code < 400 and not strong_error_artifacts and not default_error_hint:
             return out
 
-        # concrete resource disclosure와 겹치면 error finding으로 올리지 않음
+        # If it overlaps with concrete resource disclosure, do not keep it as an error finding.
         if status_code == 200 and looks_like_concrete_resource_disclosure and not strong_error_artifacts:
             return out
 
@@ -1411,10 +1168,10 @@ def _build_error_disclosure_signals(
         return out
 
     title_map = {
-        "db_error": "HTTP 에러 페이지가 DB 오류를 노출함",
-        "stack_trace": "HTTP 에러 페이지가 스택트레이스를 노출함",
-        "file_path": "HTTP 에러 페이지가 내부 파일 경로를 노출함",
-        "debug_error_page": "디버그 에러 페이지가 노출됨",
+        "db_error": "HTTP Error Page Exposes Database Error Details",
+        "stack_trace": "HTTP Error Page Exposes Stack Trace",
+        "file_path": "HTTP Error Page Exposes Local File Path",
+        "debug_error_page": "Debug Error Page Exposed",
     }
 
     out.append(
@@ -1623,14 +1380,14 @@ def _build_non_error_body_disclosure_signals(
     has_internal_context_disclosure = bool(internal_ips and strong_debug_context)
     has_body_marker_disclosure = bool(body_marker_hits)
 
-    # framework/debug hint만으로는 약함
+    # Framework or debug hints alone are too weak.
     combined_framework_debug = len(framework_hints) + len(debug_hints)
     has_multi_hint_disclosure = bool(
         combined_framework_debug >= 2
         and (generic_versions or has_body_marker_disclosure)
     )
 
-    # 최종 gate
+    # Final gate.
     if not (
         has_version_disclosure
         or has_internal_context_disclosure
@@ -1703,7 +1460,7 @@ def _build_non_error_body_disclosure_signals(
             finding_type="HTTP_SYSTEM_INFO_EXPOSURE",
             family="HTTP_BODY_DISCLOSURE",
             subtype=subtype,
-            title="HTTP 응답 본문이 시스템 정보를 노출함",
+            title="System Information Exposed In HTTP Response Body",
             severity=severity,
             confidence=confidence,
             where="response.body",
@@ -1763,7 +1520,7 @@ def _build_directory_listing_signals(
             finding_type="DIRECTORY_LISTING_ENABLED",
             family="DIRECTORY_LISTING",
             subtype="directory_listing",
-            title="Directory listing 이 활성화된 것으로 보임",
+            title="Directory listing appears to be enabled",
             severity="Medium",
             confidence=0.88,
             where="response.body",
@@ -1821,7 +1578,7 @@ def _build_default_resource_signals(
     config_markers = _dedup(feats.get("config_exposure_markers") or [])
     log_patterns = _dedup(feats.get("log_exposure_patterns") or [])
 
-    # phpinfo route인데 concrete phpinfo marker가 부족하면 default_resource로도 올리지 않음
+    # If this is a phpinfo route but concrete phpinfo markers are missing, do not keep it as default_resource either.
     phpinfo_route_like = (
         "phpinfo.php" in url_l
         or url_l.endswith("/phpinfo")
@@ -1831,7 +1588,7 @@ def _build_default_resource_signals(
         if not _phpinfo_has_concrete_marker(snapshot, feats):
             return []
 
-    title = "기본 또는 민감 리소스가 직접 노출됨"
+    title = "Default Or Sensitive Resource Exposed Directly"
     confidence = 0.84
     severity = "Medium"
     exposed_information: List[str] = []
@@ -2048,7 +1805,7 @@ def _build_phpinfo_signal(
             finding_type="PHPINFO_EXPOSURE",
             family="HTTP_BODY_DISCLOSURE",
             subtype="phpinfo",
-            title="phpinfo() 페이지가 노출됨",
+            title="phpinfo() Page Exposed",
             severity="Medium",
             confidence=0.96,
             where="response.body",
@@ -2307,7 +2064,7 @@ def _build_log_exposure_signal(
     if _is_external_auth_transition(requested_url, final_url):
         return []
 
-    # login / instructions / css / image / readme 류는 원칙적으로 로그 판단 금지
+    # Aggressively block login, instructions, css, image, and readme-style paths from log exposure detection.
     low_value_path_tokens = (
         "/login",
         "/signin",
@@ -2329,7 +2086,7 @@ def _build_log_exposure_signal(
     if any(tok in final_path_l for tok in low_value_path_tokens):
         return []
 
-    # 진짜 로그 경로만 인정
+    # Recognize only paths that really look like log locations.
     log_file_or_dir_patterns = [
         r"(?:^|/)logs?(?:/|$)",
         r"(?:^|/)(?:access|error|debug|application|server)\.log(?:$|[/?#])",
@@ -2339,7 +2096,7 @@ def _build_log_exposure_signal(
     ]
     path_like_log = any(re.search(pat, final_path_l, re.I) for pat in log_file_or_dir_patterns)
 
-    # 실제 로그 라인 샘플 추출
+    # Extract concrete log-line samples.
     access_log_lines = re.findall(
         r'(?im)^\s*\d{1,3}(?:\.\d{1,3}){3}\s+\S+\s+\S+\s+\[[^\]]+\]\s+"(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+[^"]+\s+HTTP/[0-9.]+"\s+\d{3}\s+\d+.*$',
         body_text,
@@ -2360,7 +2117,7 @@ def _build_log_exposure_signal(
         body_text,
     )
 
-    # 문서/README/설치가이드류 차단
+    # Filter out document, README, and setup-guide style content.
     document_like = any(
         tok in body_l
         for tok in (
@@ -2379,7 +2136,7 @@ def _build_log_exposure_signal(
         )
     )
 
-    # 실제 로그 샘플 수
+    # Collect concrete log samples.
     concrete_log_lines: List[str] = []
     for line in access_log_lines[:3]:
         s = line.strip()
@@ -2394,15 +2151,15 @@ def _build_log_exposure_signal(
         if s and s not in concrete_log_lines:
             concrete_log_lines.append(s)
 
-    # stack trace만 있다고 로그 노출로 보지 않음
+    # A stack trace alone is not enough to classify this as log exposure.
     if not concrete_log_lines:
         return []
 
-    # 문서류는 더 강하게 차단
+    # Suppress document-like content aggressively.
     if document_like and not path_like_log:
         return []
 
-    # 로그 경로도 아니고 로그 샘플도 2줄 미만이면 버림
+    # If the path is not log-like and there are fewer than two concrete log samples, discard it.
     if not path_like_log and len(concrete_log_lines) < 2:
         return []
 
@@ -2416,7 +2173,7 @@ def _build_log_exposure_signal(
             finding_type="LOG_VIEWER_EXPOSURE",
             family="HTTP_BODY_DISCLOSURE",
             subtype="log_content",
-            title="애플리케이션 또는 접근 로그 내용이 HTTP로 노출됨",
+            title="Application Or Access Log Content Exposed Over HTTP",
             severity="Medium",
             confidence=confidence,
             where="response.body",
@@ -2498,7 +2255,7 @@ def _build_file_path_handling_signal(
             finding_type="FILE_PATH_HANDLING_ANOMALY",
             family="HTTP_ERROR_DISCLOSURE",
             subtype="file_path_parameter",
-            title="파일/경로 파라미터 처리에서 내부 동작이 노출됨",
+            title="File Or Path Parameter Handling Exposes Internal Behavior",
             severity="Medium",
             confidence=0.89 if file_paths or stack_traces else 0.84,
             where="response.body",
@@ -2563,7 +2320,7 @@ def _build_cors_signals(
             finding_type="CORS_MISCONFIG",
             family="CORS_MISCONFIG",
             subtype=subtype,
-            title="과도한 CORS 정책이 관찰됨",
+            title="Overly permissive CORS policy observed",
             severity=severity,
             confidence=confidence,
             where="response.headers",
@@ -2651,7 +2408,7 @@ def _build_header_policy_signals(
                 finding_type="CLICKJACKING",
                 family="HTTP_HEADER_SECURITY",
                 subtype="clickjacking_protection_missing",
-                title="Clickjacking 보호 헤더가 없음",
+                title="Missing clickjacking protection headers",
                 severity="Low",
                 confidence=0.86,
                 where="response.headers",
@@ -2682,7 +2439,7 @@ def _build_header_policy_signals(
                 finding_type="CSP_MISSING",
                 family="HTTP_HEADER_SECURITY",
                 subtype="csp_missing",
-                title="Content-Security-Policy 헤더가 없음",
+                title="Missing Content-Security-Policy header",
                 severity="Low",
                 confidence=0.82,
                 where="response.headers",
@@ -2708,7 +2465,7 @@ def _build_header_policy_signals(
                 finding_type="CONTENT_TYPE_SNIFFING",
                 family="HTTP_HEADER_SECURITY",
                 subtype="content_type_sniffing",
-                title="X-Content-Type-Options 헤더가 없음",
+                title="Missing X-Content-Type-Options header",
                 severity="Low",
                 confidence=0.88,
                 where="response.headers",
@@ -2734,7 +2491,7 @@ def _build_header_policy_signals(
                 finding_type="REFERRER_POLICY_MISSING",
                 family="HTTP_HEADER_SECURITY",
                 subtype="referrer_policy_missing",
-                title="Referrer-Policy 헤더가 없음",
+                title="Missing Referrer-Policy header",
                 severity="Info",
                 confidence=0.80,
                 where="response.headers",
@@ -2760,7 +2517,7 @@ def _build_header_policy_signals(
                 finding_type="PERMISSIONS_POLICY_MISSING",
                 family="HTTP_HEADER_SECURITY",
                 subtype="permissions_policy_missing",
-                title="Permissions-Policy 헤더가 없음",
+                title="Missing Permissions-Policy header",
                 severity="Info",
                 confidence=0.78,
                 where="response.headers",
@@ -2850,8 +2607,8 @@ def _build_cookie_signals(
         secure_present = bool(cookie.get("secure"))
         httponly_present = bool(cookie.get("httponly"))
 
-        # response에 실제 Set-Cookie 된 쿠키 중에서만 판단
-        # request에만 있었던 쿠키는 이 함수에서 취약점으로 올리지 않음
+        # Only evaluate cookies that were actually observed in Set-Cookie response headers.
+        # Do not report a weakness from request-only cookies that were never set by the response.
         target_cookie = (
             sensitive_cookie
             or request_sensitive_candidate
@@ -2890,7 +2647,7 @@ def _build_cookie_signals(
                         finding_type="COOKIE_HTTPONLY_MISSING",
                         family="COOKIE_SECURITY",
                         subtype="httponly_missing",
-                        title=f"Cookie '{name}' 에 HttpOnly 속성이 없음",
+                        title=f"Cookie '{name}' missing HttpOnly attribute",
                         severity="Low",
                         confidence=0.92 if (sensitive_cookie or request_sensitive_candidate) else 0.84,
                         where="response.headers",
@@ -2917,7 +2674,7 @@ def _build_cookie_signals(
                         finding_type="COOKIE_SECURE_MISSING",
                         family="COOKIE_SECURITY",
                         subtype="secure_missing",
-                        title=f"Cookie '{name}' 에 Secure 속성이 없음",
+                        title=f"Cookie '{name}' missing Secure attribute",
                         severity="Low" if is_https_response else "Info",
                         confidence=0.94 if (is_https_response and (sensitive_cookie or request_sensitive_candidate or prefix in {"__Host-", "__Secure-"})) else 0.82,
                         where="response.headers",
@@ -2944,7 +2701,7 @@ def _build_cookie_signals(
                         finding_type="COOKIE_SAMESITE_MISSING",
                         family="COOKIE_SECURITY",
                         subtype="samesite_missing",
-                        title=f"Cookie '{name}' 에 SameSite 속성이 없음",
+                        title=f"Cookie '{name}' missing SameSite attribute",
                         severity="Info",
                         confidence=0.86 if (sensitive_cookie or request_sensitive_candidate) else 0.80,
                         where="response.headers",
@@ -3011,7 +2768,7 @@ def _build_method_signals(
                 finding_type="TRACE_ENABLED",
                 family="HTTP_METHOD_SECURITY",
                 subtype="trace_reflection",
-                title="TRACE 메서드가 활성화되어 요청 내용을 반사함",
+                title="TRACE Method Reflects Request Content",
                 severity="Medium",
                 confidence=0.90,
                 where="response.body",
@@ -3081,7 +2838,7 @@ def _build_method_signals(
             finding_type="RISKY_HTTP_METHODS_ENABLED",
             family="HTTP_METHOD_SECURITY",
             subtype="risky_methods_enabled",
-            title="위험 가능성이 있는 HTTP 메서드가 허용되거나 처리됨",
+            title="Risky HTTP Methods Are Enabled Or Handled",
             severity=severity,
             confidence=confidence,
             where="response.headers",
@@ -3144,7 +2901,7 @@ def _build_transport_signals(
                 finding_type="HTTPS_REDIRECT_MISSING",
                 family="TRANSPORT_SECURITY",
                 subtype="https_redirect_missing",
-                title="HTTP 엔드포인트가 HTTPS 강제를 하지 않음",
+                title="HTTP Endpoint Does Not Enforce HTTPS",
                 severity="Info",
                 confidence=0.78,
                 where="response.headers",
@@ -3176,7 +2933,7 @@ def _build_transport_signals(
                 finding_type="HSTS_MISSING",
                 family="TRANSPORT_SECURITY",
                 subtype="hsts_missing",
-                title="HTTPS 응답에 HSTS 헤더가 없음",
+                title="HTTPS Response Missing HSTS Header",
                 severity="Low",
                 confidence=0.76,
                 where="response.headers",
@@ -3202,6 +2959,86 @@ def _build_transport_signals(
 
     return out
 
+
+def _build_policy_signals(
+    request_meta: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    feats: Dict[str, Any],
+    *,
+    response_kind: str,
+    final_url: str,
+    technology_fingerprint: List[str],
+) -> List[Dict[str, Any]]:
+    return _build_policy_signal_bundle(
+        request_meta,
+        snapshot,
+        feats,
+        response_kind=response_kind,
+        final_url=final_url,
+        technology_fingerprint=technology_fingerprint,
+    )
+
+
+def _build_disclosure_signals(
+    request_meta: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    feats: Dict[str, Any],
+    *,
+    status_code: int | None,
+    response_kind: str,
+    final_url: str,
+    technology_fingerprint: List[str],
+    tech: str,
+    info_skip: bool,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    out.extend(_build_error_disclosure_signals(
+        request_meta, status_code, response_kind, final_url, snapshot, feats, technology_fingerprint, tech
+    ))
+    out.extend(
+        build_detector_disclosure_signals(
+            request_meta=request_meta,
+            snapshot=snapshot,
+            feats=feats,
+            info_skip=info_skip,
+        )
+    )
+    if info_skip:
+        return out
+    out.extend(_build_header_disclosure_signals(
+        request_meta, snapshot, feats, response_kind, final_url, technology_fingerprint, tech
+    ))
+    out.extend(_build_non_error_body_disclosure_signals(
+        request_meta, snapshot, feats, response_kind, final_url, technology_fingerprint, tech
+    ))
+    out.extend(_build_file_path_handling_signal(request_meta, snapshot, feats))
+    return out
+
+
+def _build_resource_exposure_signals(
+    request_meta: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    feats: Dict[str, Any],
+    *,
+    response_kind: str,
+    final_url: str,
+    technology_fingerprint: List[str],
+    resource_skip: bool,
+) -> List[Dict[str, Any]]:
+    if resource_skip:
+        return []
+    out: List[Dict[str, Any]] = []
+    out.extend(_build_directory_listing_signals(
+        response_kind, final_url, snapshot, feats, technology_fingerprint
+    ))
+    out.extend(_build_default_resource_signals(
+        response_kind, final_url, snapshot, feats, technology_fingerprint
+    ))
+    out.extend(_build_phpinfo_signal(request_meta, snapshot, feats))
+    out.extend(_build_config_exposure_signal(request_meta, snapshot, feats))
+    out.extend(_build_log_exposure_signal(request_meta, snapshot, feats))
+    return out
+
 def collect_http_signals(
     request_meta: Dict[str, Any],
     snapshot: Dict[str, Any],
@@ -3214,116 +3051,40 @@ def collect_http_signals(
     technology_fingerprint = _dedup(feats.get("technology_fingerprint") or [])
     tech = _first(technology_fingerprint) or "unknown"
 
-    out: List[Dict[str, Any]] = []
-
-    # always-on policy / posture findings
-    out.extend(_build_cors_signals(response_kind, final_url, feats, technology_fingerprint))
-    out.extend(_build_header_policy_signals(
-        request_meta, snapshot, feats, response_kind, final_url, technology_fingerprint
-    ))
-    out.extend(_build_cookie_signals(
-        request_meta, response_kind, final_url, feats, technology_fingerprint
-    ))
-    out.extend(_build_method_signals(
-        request_meta, response_kind, final_url, feats, technology_fingerprint
-    ))
-    out.extend(_build_transport_signals(
-        request_meta, snapshot, feats, response_kind, final_url, technology_fingerprint
-    ))
-
-    # error disclosure는 공통 skip보다 우선
-    out.extend(_build_error_disclosure_signals(
-        request_meta, status_code, response_kind, final_url, snapshot, feats, technology_fingerprint, tech
-    ))
-
     info_skip = _should_skip_info_disclosure(request_meta, snapshot, feats)
     resource_skip = _should_skip_resource_exposure(request_meta, snapshot, feats)
+    out: List[Dict[str, Any]] = []
+    out.extend(_build_policy_signals(
+        request_meta,
+        snapshot,
+        feats,
+        response_kind=response_kind,
+        final_url=final_url,
+        technology_fingerprint=technology_fingerprint,
+    ))
+    out.extend(_build_disclosure_signals(
+        request_meta,
+        snapshot,
+        feats,
+        status_code=status_code,
+        response_kind=response_kind,
+        final_url=final_url,
+        technology_fingerprint=technology_fingerprint,
+        tech=tech,
+        info_skip=info_skip,
+    ))
+    out.extend(_build_resource_exposure_signals(
+        request_meta,
+        snapshot,
+        feats,
+        response_kind=response_kind,
+        final_url=final_url,
+        technology_fingerprint=technology_fingerprint,
+        resource_skip=resource_skip,
+    ))
 
-    if not info_skip:
-        out.extend(_build_header_disclosure_signals(
-            request_meta, snapshot, feats, response_kind, final_url, technology_fingerprint, tech
-        ))
-        out.extend(_build_non_error_body_disclosure_signals(
-            request_meta, snapshot, feats, response_kind, final_url, technology_fingerprint, tech
-        ))
-        out.extend(_build_file_path_handling_signal(request_meta, snapshot, feats))
-
-    if not resource_skip:
-        out.extend(_build_directory_listing_signals(
-            response_kind, final_url, snapshot, feats, technology_fingerprint
-        ))
-        out.extend(_build_default_resource_signals(
-            response_kind, final_url, snapshot, feats, technology_fingerprint
-        ))
-        out.extend(_build_phpinfo_signal(request_meta, snapshot, feats))
-        out.extend(_build_config_exposure_signal(request_meta, snapshot, feats))
-        out.extend(_build_log_exposure_signal(request_meta, snapshot, feats))
-
-    deduped: List[Dict[str, Any]] = []
-    seen = set()
-    for item in out:
-        marker = (
-            str(item.get("finding_type") or ""),
-            str(item.get("subtype") or ""),
-            str(item.get("policy_object") or ""),
-            str(item.get("root_cause_signature") or ""),
-            str((item.get("evidence") or {}).get("final_url") or ""),
-        )
-        if marker in seen:
-            continue
-        seen.add(marker)
-        deduped.append(item)
-
-    final_signals: List[Dict[str, Any]] = []
-    final_url_to_types: Dict[str, Set[str]] = {}
-
-    for item in deduped:
-        item_final_url = str((item.get("evidence") or {}).get("final_url") or "")
-        final_url_to_types.setdefault(item_final_url, set()).add(str(item.get("finding_type") or ""))
-
-    for item in deduped:
-        finding_type = str(item.get("finding_type") or "")
-        family = str(item.get("family") or "")
-        subtype = str(item.get("subtype") or "")
-        item_final_url = str((item.get("evidence") or {}).get("final_url") or "")
-        same_url_types = final_url_to_types.get(item_final_url, set())
-
-        if finding_type == "HTTP_SYSTEM_INFO_EXPOSURE":
-            if "PHPINFO_EXPOSURE" in same_url_types:
-                continue
-            if "HTTP_CONFIG_FILE_EXPOSURE" in same_url_types:
-                continue
-            if "LOG_VIEWER_EXPOSURE" in same_url_types:
-                continue
-            if "DEFAULT_FILE_EXPOSED" in same_url_types and family == "HTTP_BODY_DISCLOSURE":
-                continue
-            if "HTTP_ERROR_INFO_EXPOSURE" in same_url_types and subtype in {
-                "body_info_marker",
-                "framework_hint_in_body",
-            }:
-                continue
-
-        if finding_type == "LOG_VIEWER_EXPOSURE":
-            if any(t in same_url_types for t in {
-                "PHPINFO_EXPOSURE",
-                "HTTP_CONFIG_FILE_EXPOSURE",
-                "HTTP_ERROR_INFO_EXPOSURE",
-            }):
-                continue
-
-        if finding_type == "DEFAULT_FILE_EXPOSED":
-            if "PHPINFO_EXPOSURE" in same_url_types and subtype == "phpinfo_page":
-                continue
-
-        final_signals.append(item)
-
-    final_signals.sort(
-        key=lambda x: (
-            _severity_rank(x.get("severity", "Info")) * -1,
-            x.get("finding_type") or "",
-            x.get("title") or "",
-        )
-    )
+    final_signals = finalize_http_signals(out, severity_rank_fn=_severity_rank)
+    deduped = final_signals
 
     log(
         "SCAN",
@@ -3358,15 +3119,15 @@ def _should_skip_info_disclosure(
     requested_url = str(request_meta.get("url") or "")
     final_url = str(feats.get("final_url") or snapshot.get("final_url") or requested_url or "")
 
-    # static asset은 계속 제외
+    # Exclude static assets.
     if _is_static_response(feats):
         return True
 
-    # 외부 auth transition은 제외
+    # Exclude external authentication transitions.
     if _is_external_auth_transition(requested_url, final_url):
         return True
 
-    # 여기부터는 "강한 에러/노출 신호가 있으면 skip 금지"
+    # Do not skip when strong error or disclosure signals are already present.
     has_strong_error_like_signal = bool(
         feats.get("error_exposure_class")
         or (feats.get("stack_traces") or [])
@@ -3378,7 +3139,7 @@ def _should_skip_info_disclosure(
     if has_strong_error_like_signal:
         return False
 
-    # 약한 auth redirect / generic notfound만 있을 때만 skip
+    # Skip only for weak auth redirects or generic not-found pages.
     if _is_auth_redirect(snapshot):
         return True
 
@@ -3415,577 +3176,3 @@ def _should_skip_resource_exposure(
     return False
 
 
-validation_policy.py
-from __future__ import annotations
-
-from typing import Any, Dict
-
-from agent.evidence_policy import (
-    has_strong_config_evidence,
-    has_strong_log_evidence,
-    has_strong_phpinfo_evidence,
-    is_direct_200_observation,
-    is_low_value_disclosure,
-)
-from agent.finding_types import AMBIGUOUS_TYPES, CONCRETE_EXPOSURE_TYPES, DETERMINISTIC_TYPES
-
-
-def _evidence(candidate: Dict[str, Any]) -> Dict[str, Any]:
-    ev = candidate.get("evidence") or {}
-    return ev if isinstance(ev, dict) else {}
-
-
-def _severity_rank(sev: str) -> int:
-    order = {"Info": 1, "Low": 2, "Medium": 3, "High": 4}
-    return order.get(str(sev or "Info"), 1)
-
-
-def _min_severity(a: str, b: str) -> str:
-    return a if _severity_rank(a) <= _severity_rank(b) else b
-
-
-def _max_severity(a: str, b: str) -> str:
-    return a if _severity_rank(a) >= _severity_rank(b) else b
-
-
-def _ensure_verification(candidate: Dict[str, Any]) -> Dict[str, Any]:
-    candidate.setdefault("verification", {})
-    verification = candidate["verification"]
-    if not isinstance(verification, dict):
-        verification = {}
-        candidate["verification"] = verification
-    return verification
-
-
-def _apply_final_verdict_state(candidate: Dict[str, Any]) -> Dict[str, Any]:
-    verification = _ensure_verification(candidate)
-    verdict = str(verification.get("verdict") or "").upper()
-
-    if verdict == "FALSE_POSITIVE":
-        candidate["final_severity"] = "Info"
-        candidate["severity"] = "Info"
-        candidate["severity_validation_reason"] = "Marked as false positive after verification."
-        return candidate
-
-    if verdict == "INFORMATIONAL":
-        final_sev = str(candidate.get("final_severity") or "Info")
-        candidate["final_severity"] = final_sev
-        candidate["severity"] = final_sev
-        if not candidate.get("severity_validation_reason"):
-            candidate["severity_validation_reason"] = "Informational signal retained after validation."
-        return candidate
-
-    if verdict == "CONFIRMED":
-        final_sev = str(candidate.get("final_severity") or candidate.get("severity") or "Info")
-        candidate["final_severity"] = final_sev
-        candidate["severity"] = final_sev
-        return candidate
-
-    candidate["final_severity"] = str(candidate.get("final_severity") or candidate.get("severity") or "Info")
-    candidate["severity"] = candidate["final_severity"]
-    return candidate
-
-
-def _has_local_file_path(candidate: Dict[str, Any]) -> bool:
-    evidence = _evidence(candidate)
-    file_paths = evidence.get("file_paths") or []
-
-    for path in file_paths:
-        s = str(path or "").strip().lower()
-        if s.startswith(("/var/", "/usr/", "/opt/", "/home/", "/etc/", "/app/", "/workspace/")):
-            return True
-        if ":\\" in s:
-            return True
-    return False
-
-
-def _is_concrete_error_disclosure(candidate: Dict[str, Any]) -> bool:
-    evidence = _evidence(candidate)
-    status_code = candidate.get("status_code") or evidence.get("status_code")
-
-    stack_traces = evidence.get("stack_traces") or []
-    file_paths = evidence.get("file_paths") or []
-    db_errors = evidence.get("db_errors") or []
-    debug_hints = evidence.get("debug_hints") or []
-    default_error_hint = evidence.get("default_error_hint")
-
-    if db_errors:
-        return True
-
-    if stack_traces:
-        return True
-
-    if file_paths and _has_local_file_path(candidate):
-        return True
-
-    if status_code in {400, 401, 403, 404, 405, 500, 502, 503}:
-        if file_paths or stack_traces or db_errors:
-            return True
-
-    if default_error_hint and len(debug_hints) >= 2 and (file_paths or stack_traces or db_errors):
-        return True
-
-    return False
-
-def _has_concrete_system_info(candidate: Dict[str, Any]) -> bool:
-    evidence = _evidence(candidate)
-
-    strong_versions = evidence.get("strong_version_tokens_in_body") or []
-    internal_ips = evidence.get("internal_ips") or []
-    body_markers = evidence.get("body_info_markers") or []
-    framework_hints = evidence.get("framework_hints") or []
-    debug_hints = evidence.get("debug_hints") or []
-    stack_traces = evidence.get("stack_traces") or []
-    db_errors = evidence.get("db_errors") or []
-    file_paths = evidence.get("file_paths") or []
-    decision_reasons = evidence.get("decision_reasons") or []
-    response_kind = str(evidence.get("response_kind") or "").lower()
-
-    # HTML shell / weak document-like 페이지는 concrete system info로 보지 않음
-    if response_kind == "static_asset":
-        return False
-
-    # strong version token은 concrete
-    if strong_versions:
-        return True
-
-    # internal IP는 debug/error context가 같이 있을 때만 concrete
-    if internal_ips and (framework_hints or debug_hints or stack_traces or db_errors or file_paths):
-        return True
-
-    # 강한 제품/프레임워크 배너 마커
-    strong_body_markers = [
-        x for x in body_markers
-        if any(tok in str(x).lower() for tok in (
-            "apache tomcat/",
-            "jboss eap",
-            "wildfly/",
-            "undertow/",
-            "weblogic",
-            "websphere",
-            "spring boot",
-            "django ",
-            "flask ",
-            "laravel ",
-            "asp.net",
-            "wordpress",
-            "drupal",
-            "struts",
-        ))
-    ]
-    if strong_body_markers:
-        return True
-
-    # classifier가 이미 다중 힌트로 올린 경우만 제한적으로 인정
-    if "multi_hint_disclosure" in [str(x) for x in decision_reasons]:
-        if len(framework_hints) + len(debug_hints) >= 2:
-            return True
-
-    return False
-
-def _has_concrete_default_resource_exposure(candidate: Dict[str, Any]) -> bool:
-    evidence = _evidence(candidate)
-    subtype = str(candidate.get("subtype") or "")
-
-    phpinfo_indicators = evidence.get("phpinfo_indicators") or []
-    config_markers = evidence.get("config_exposure_markers") or []
-    log_patterns = evidence.get("log_exposure_patterns") or []
-    default_hints = evidence.get("default_file_hints") or []
-    body_snippet = str(evidence.get("body_snippet") or "").lower()
-
-    if subtype == "phpinfo_page":
-        return len(phpinfo_indicators) >= 2 or (
-            "phpinfo()" in body_snippet and "php version" in body_snippet
-        )
-
-    if subtype == "env_file":
-        return bool(config_markers)
-
-    if subtype == "git_metadata":
-        return (
-            "[core]" in body_snippet
-            or "repositoryformatversion" in body_snippet
-            or "filemode =" in body_snippet
-            or "bare =" in body_snippet
-            or bool(default_hints)
-        )
-
-    if subtype == "server_status":
-        return (
-            "apache server status" in body_snippet
-            or "server uptime" in body_snippet
-            or "total accesses" in body_snippet
-            or bool(default_hints)
-        )
-
-    if subtype == "actuator_endpoint":
-        marker_count = 0
-        for marker in ('"status"', '"components"', '"_links"', "/actuator"):
-            if marker in body_snippet:
-                marker_count += 1
-        return marker_count >= 2
-
-    if subtype == "debug_endpoint":
-        marker_count = 0
-        for marker in ("debug toolbar", "trace", "environment", "application config"):
-            if marker in body_snippet:
-                marker_count += 1
-        return marker_count >= 2
-
-    return bool(phpinfo_indicators or config_markers or log_patterns or default_hints)
-
-
-def _cap_deterministic_severity(candidate: Dict[str, Any], current_sev: str) -> str:
-    candidate_type = str(candidate.get("type") or "")
-    policy_object = str(candidate.get("policy_object") or "").lower()
-
-    if candidate_type == "HTTPS_REDIRECT_MISSING":
-        return "Info"
-
-    if candidate_type == "HSTS_MISSING":
-        return _min_severity(current_sev, "Low")
-
-    if candidate_type == "COOKIE_HTTPONLY_MISSING":
-        return _min_severity(current_sev, "Low")
-
-    if candidate_type == "COOKIE_SECURE_MISSING":
-        return _min_severity(current_sev, "Low")
-
-    if candidate_type == "COOKIE_SAMESITE_MISSING":
-        return "Info"
-
-    if candidate_type == "TRACE_ENABLED":
-        return _min_severity(current_sev, "Medium")
-
-    if candidate_type == "RISKY_HTTP_METHODS_ENABLED":
-        return "Info"
-
-    if candidate_type in {"HTTP_PUT_UPLOAD_CAPABILITY", "HTTP_DELETE_CAPABILITY"}:
-        return _max_severity(current_sev, "Medium")
-
-    if candidate_type == "CLICKJACKING":
-        return _min_severity(current_sev, "Low")
-
-    if candidate_type == "CSP_MISSING":
-        return _min_severity(current_sev, "Low")
-
-    if candidate_type == "CONTENT_TYPE_SNIFFING":
-        return _min_severity(current_sev, "Low")
-
-    if candidate_type in {"REFERRER_POLICY_MISSING", "PERMISSIONS_POLICY_MISSING"}:
-        return "Info"
-
-    if candidate_type == "CORS_MISCONFIG":
-        return current_sev
-
-    if candidate_type == "DIRECTORY_LISTING_ENABLED":
-        return _max_severity(current_sev, "Medium")
-
-    if candidate_type == "SECURITY_HEADERS_MISSING":
-        if policy_object in {"content-security-policy", "x-frame-options", "x-content-type-options"}:
-            return _min_severity(current_sev, "Low")
-        return "Info"
-
-    return current_sev
-
-def _is_phpinfo_route_error_false_positive(candidate: Dict[str, Any]) -> bool:
-    if str(candidate.get("type") or "") != "HTTP_ERROR_INFO_EXPOSURE":
-        return False
-
-    evidence = _evidence(candidate)
-
-    final_url = str(evidence.get("final_url") or "").lower()
-    requested_url = str(evidence.get("requested_url") or "").lower()
-    subtype = str(candidate.get("subtype") or "")
-
-    route_hint = any(
-        tok in (final_url + " " + requested_url)
-        for tok in ("phpinfo.php", "/phpinfo", "/info.php")
-    )
-    if not route_hint:
-        return False
-
-    stack_traces = evidence.get("stack_traces") or []
-    file_paths = evidence.get("file_paths") or []
-    db_errors = evidence.get("db_errors") or []
-    phpinfo_indicators = evidence.get("phpinfo_indicators") or []
-
-    # 진짜 stack/file path 노출이면 error finding 유지 가능
-    if stack_traces:
-        return False
-    if file_paths and _has_local_file_path(candidate):
-        return False
-
-    # phpinfo 경로에서 db_error만 약하게 걸린 경우는 오탐 처리
-    if subtype == "db_error" and (db_errors or phpinfo_indicators):
-        return True
-
-    # phpinfo 힌트가 있는데 concrete error artifact가 없으면 오탐
-    if phpinfo_indicators and not stack_traces and not file_paths:
-        return True
-
-    return False
-
-def _cap_ambiguous_confirmed_severity(candidate: Dict[str, Any], current_sev: str) -> str:
-    candidate_type = str(candidate.get("type") or "")
-
-    if candidate_type in {"PHPINFO_EXPOSURE", "HTTP_CONFIG_FILE_EXPOSURE", "LOG_VIEWER_EXPOSURE"}:
-        return _max_severity(current_sev, "Medium")
-
-    if candidate_type in {"HTTP_ERROR_INFO_EXPOSURE", "FILE_PATH_HANDLING_ANOMALY"}:
-        return _max_severity(current_sev, "Medium")
-
-    if candidate_type == "HTTP_SYSTEM_INFO_EXPOSURE":
-        return _max_severity(current_sev, "Low")
-
-    if candidate_type == "DEFAULT_FILE_EXPOSED":
-        return _max_severity(current_sev, "Medium") if _has_concrete_default_resource_exposure(candidate) else "Info"
-
-    return current_sev
-
-
-def _set_informational(
-    candidate: Dict[str, Any],
-    *,
-    reason: str,
-    severity: str = "Info",
-) -> Dict[str, Any]:
-    verification = _ensure_verification(candidate)
-    candidate["final_severity"] = severity
-    candidate["severity"] = severity
-    candidate["severity_validation_reason"] = reason
-    verification["verdict"] = "INFORMATIONAL"
-    verification["reason"] = verification.get("reason") or reason
-    return _apply_final_verdict_state(candidate)
-
-
-def _set_confirmed(
-    candidate: Dict[str, Any],
-    *,
-    reason: str,
-    severity: str | None = None,
-) -> Dict[str, Any]:
-    verification = _ensure_verification(candidate)
-    final_sev = severity or str(candidate.get("final_severity") or candidate.get("severity") or "Info")
-    candidate["final_severity"] = final_sev
-    candidate["severity"] = final_sev
-    candidate["severity_validation_reason"] = reason
-    verification["verdict"] = "CONFIRMED"
-    verification["reason"] = verification.get("reason") or reason
-    return _apply_final_verdict_state(candidate)
-
-def validate_candidate_after_llm(candidate: Dict[str, Any]) -> Dict[str, Any]:
-    candidate_type = str(candidate.get("type") or "")
-    current_sev = str(candidate.get("severity") or "Info")
-    candidate["llm_severity"] = current_sev
-
-    verification = _ensure_verification(candidate)
-    existing_verdict = str(verification.get("verdict") or "").upper()
-
-    # ------------------------------------------------------------
-    # actively confirmed capability findings
-    # ------------------------------------------------------------
-    if candidate_type == "RISKY_HTTP_METHODS_ENABLED":
-        evidence = _evidence(candidate)
-        observed_caps = sorted({str(x).upper() for x in (evidence.get("risky_methods_enabled") or []) if x})
-        candidate["final_severity"] = "Info"
-        candidate["severity"] = "Info"
-        candidate["severity_validation_reason"] = (
-            "Risky methods were observed or handled, but this root finding remains informational."
-        )
-        verification["verdict"] = "INFORMATIONAL"
-        verification["reason"] = (
-            "Observed risky HTTP method handling without confirmed exploitability."
-            + (f" Observed methods: {', '.join(observed_caps)}." if observed_caps else "")
-        )
-        return _apply_final_verdict_state(candidate)
-
-    if candidate_type in {"HTTP_PUT_UPLOAD_CAPABILITY", "HTTP_DELETE_CAPABILITY"}:
-        candidate["final_severity"] = _max_severity(current_sev, "Medium")
-        candidate["severity"] = candidate["final_severity"]
-
-        if candidate_type == "HTTP_PUT_UPLOAD_CAPABILITY":
-            verification["verdict"] = "CONFIRMED"
-            verification["reason"] = (
-                verification.get("reason")
-                or "Confirmed HTTP PUT upload capability by uploading a canary resource and retrieving it successfully."
-            )
-            candidate["severity_validation_reason"] = (
-                "Arbitrary PUT upload capability was actively confirmed with retrieval verification."
-            )
-        else:
-            verification["verdict"] = "CONFIRMED"
-            verification["reason"] = (
-                verification.get("reason")
-                or "Confirmed HTTP DELETE capability by deleting a canary resource and verifying that it was no longer accessible."
-            )
-            candidate["severity_validation_reason"] = (
-                "HTTP DELETE capability was actively confirmed with post-delete absence verification."
-            )
-
-        return _apply_final_verdict_state(candidate)
-
-    # ------------------------------------------------------------
-    # explicit false positive wins
-    # ------------------------------------------------------------
-    if existing_verdict == "FALSE_POSITIVE":
-        candidate["final_severity"] = "Info"
-        candidate["severity"] = "Info"
-        candidate["severity_validation_reason"] = "Marked as false positive after verification."
-        return _apply_final_verdict_state(candidate)
-
-    # ------------------------------------------------------------
-    # deterministic findings
-    # ------------------------------------------------------------
-    if candidate_type in DETERMINISTIC_TYPES:
-        candidate["final_severity"] = _cap_deterministic_severity(candidate, current_sev)
-        candidate["severity"] = candidate["final_severity"]
-        candidate["severity_validation_reason"] = "Deterministic HTTP finding normalized by validation policy."
-
-        if candidate_type == "HTTPS_REDIRECT_MISSING":
-            verification["verdict"] = "INFORMATIONAL"
-            verification["reason"] = "Informational transport-security posture."
-        else:
-            verification["verdict"] = "CONFIRMED"
-            verification["reason"] = verification.get("reason") or "Confirmed deterministic HTTP finding."
-
-        return _apply_final_verdict_state(candidate)
-
-    # ------------------------------------------------------------
-    # ambiguous findings
-    # ------------------------------------------------------------
-    if candidate_type in AMBIGUOUS_TYPES:
-        # phpinfo route에서 잘못 붙은 error disclosure 선제 차단
-        if _is_phpinfo_route_error_false_positive(candidate):
-            verification["verdict"] = "FALSE_POSITIVE"
-            verification["reason"] = (
-                "phpinfo-like route produced weak DB/debug-like text without concrete stack trace or local file path disclosure."
-            )
-            candidate["final_severity"] = "Info"
-            candidate["severity"] = "Info"
-            candidate["severity_validation_reason"] = (
-                "Weak phpinfo-route error signal was classified as false positive."
-            )
-            return _apply_final_verdict_state(candidate)
-
-        # already confirmed -> keep, but cap sanely
-        if existing_verdict == "CONFIRMED":
-            if candidate_type == "DEFAULT_FILE_EXPOSED":
-                if not _has_concrete_default_resource_exposure(candidate):
-                    return _set_informational(
-                        candidate,
-                        reason="Resource-like path was reproducible, but concrete resource content exposure was not established.",
-                        severity="Info",
-                    )
-
-            capped = _cap_ambiguous_confirmed_severity(candidate, current_sev)
-            return _set_confirmed(
-                candidate,
-                reason="Ambiguous finding retained as confirmed after verification.",
-                severity=capped,
-            )
-
-        if is_low_value_disclosure(candidate):
-            return _set_informational(
-                candidate,
-                reason="Low-value or weak disclosure signal downgraded to informational.",
-                severity="Info",
-            )
-
-        if candidate_type == "HTTP_ERROR_INFO_EXPOSURE":
-            if _is_concrete_error_disclosure(candidate):
-                capped = _cap_ambiguous_confirmed_severity(candidate, current_sev)
-                return _set_confirmed(
-                    candidate,
-                    reason="Concrete error disclosure with internal artifacts was directly observed.",
-                    severity=capped,
-                )
-            return _set_informational(
-                candidate,
-                reason="Error disclosure signal was observed, but concrete internal exposure was not strong enough to confirm.",
-                severity="Info",
-            )
-
-        if candidate_type == "HTTP_SYSTEM_INFO_EXPOSURE":
-            if _has_concrete_system_info(candidate):
-                candidate["final_severity"] = _cap_ambiguous_confirmed_severity(candidate, current_sev)
-                candidate["severity"] = candidate["final_severity"]
-                candidate["severity_validation_reason"] = (
-                    "Concrete body-based system information disclosure retained after validation."
-                )
-                if verification.get("verdict") not in {"CONFIRMED", "INFORMATIONAL"}:
-                    verification["verdict"] = "INFORMATIONAL"
-                    verification["reason"] = "Concrete system-information markers observed in response body."
-                return _apply_final_verdict_state(candidate)
-
-            return _set_informational(
-                candidate,
-                reason="Weak body fingerprint was kept informational and not escalated.",
-                severity="Info",
-            )
-
-        if candidate_type in CONCRETE_EXPOSURE_TYPES and is_direct_200_observation(candidate):
-            concrete_ok = (
-                (candidate_type == "PHPINFO_EXPOSURE" and has_strong_phpinfo_evidence(candidate))
-                or (candidate_type == "HTTP_CONFIG_FILE_EXPOSURE" and has_strong_config_evidence(candidate))
-                or (candidate_type == "LOG_VIEWER_EXPOSURE" and has_strong_log_evidence(candidate))
-            )
-
-            if concrete_ok:
-                candidate["final_severity"] = _cap_ambiguous_confirmed_severity(candidate, current_sev)
-                candidate["severity"] = candidate["final_severity"]
-                candidate["severity_validation_reason"] = (
-                    "Concrete exposure was directly observed in a 200 response."
-                )
-
-                if verification.get("verdict") not in {"CONFIRMED", "INFORMATIONAL"}:
-                    verification["verdict"] = "INFORMATIONAL"
-                    verification["reason"] = (
-                        "Concrete exposure observed directly; retained meaningfully without stronger reproduce evidence."
-                    )
-                return _apply_final_verdict_state(candidate)
-
-        if candidate_type == "DEFAULT_FILE_EXPOSED":
-            if _has_concrete_default_resource_exposure(candidate) and is_direct_200_observation(candidate):
-                candidate["final_severity"] = _cap_ambiguous_confirmed_severity(candidate, current_sev)
-                candidate["severity"] = candidate["final_severity"]
-                candidate["severity_validation_reason"] = (
-                    "Concrete default/sensitive resource content was directly observed."
-                )
-
-                if verification.get("verdict") not in {"CONFIRMED", "INFORMATIONAL"}:
-                    verification["verdict"] = "INFORMATIONAL"
-                    verification["reason"] = (
-                        "Concrete default resource content was observed directly."
-                    )
-                return _apply_final_verdict_state(candidate)
-
-            return _set_informational(
-                candidate,
-                reason="Default resource signals are kept informational unless actual resource content is proven.",
-                severity="Info",
-            )
-
-        return _set_informational(
-            candidate,
-            reason="Ambiguous finding is kept informational unless verification confirms it more strongly.",
-            severity="Info",
-        )
-
-    # ------------------------------------------------------------
-    # fallback
-    # ------------------------------------------------------------
-    return _set_informational(
-        candidate,
-        reason="Unclassified or weak signal downgraded to informational.",
-        severity="Info",
-    )
-
-
-def verdict_dirname(verdict: str) -> str:
-    verdict = str(verdict or "").upper()
-    if verdict == "CONFIRMED":
-        return "confirmed"
-    if verdict == "FALSE_POSITIVE":
-        return "false_positive"
-    return "informational"

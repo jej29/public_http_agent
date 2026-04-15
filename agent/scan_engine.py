@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import re
 import time
 from typing import Any, Dict, List
 from urllib.parse import parse_qsl, urlsplit, urlunsplit, urlencode
 
 import httpx
+from agent.runtime.candidate_finalizer import (
+    _normalize_method_capability_candidates,
+    finalize_without_reproduce,
+    try_direct_finalize_candidate,
+)
+from agent.runtime.candidate_verifier import reproduce_verify
 from agent.common import log
-from agent.candidates import generate_candidates
-from agent.features import extract_features
 from agent.finding_store import merge_finding, save_raw_capture, seed_bucket_candidate
+from agent.http.http_session import (
+    clear_cookie_name_from_client,
+    cookie_jar_delta,
+    parse_manual_auth_cookie_pairs,
+    preferred_cookie_path_for_url,
+    sanitize_request_headers_and_cookie_jar,
+    snapshot_cookie_jar,
+)
 from agent.method_capability import verify_risky_http_methods_capability
 from agent.severity_engine import apply_base_severity_to_candidates, apply_combination_severity
 from agent.validation_policy import validate_candidate_after_llm
@@ -20,10 +30,8 @@ from agent.verification_policy import (
     looks_like_login_page,
     parse_login_forms,
     select_login_form,
-    should_mark_manual_review,
     should_run_llm_judge,
     should_run_reproduce,
-    should_skip_reproduce,
     verify_auth_bypass,
     verify_session_controls,
     verify_session_fixation,
@@ -53,95 +61,6 @@ HIGH_VALUE_HTTP_HINTS = (
 FILEISH_PARAM_NAMES = {
     "file", "path", "page", "template", "include", "inc", "doc", "document", "folder"
 }
-
-SESSION_COOKIE_NAMES = {
-    "jsessionid",
-    "phpsessid",
-    "session",
-    "sessionid",
-    "sid",
-    "asp.net_sessionid",
-    "connect.sid",
-}
-
-def _parse_manual_auth_cookie_pairs() -> Dict[str, str]:
-    raw = str(os.getenv("MANUAL_AUTH_COOKIE", "") or "").strip()
-    out: Dict[str, str] = {}
-
-    if not raw:
-        return out
-
-    for part in raw.split(";"):
-        piece = str(part or "").strip()
-        if not piece or "=" not in piece:
-            continue
-        k, v = piece.split("=", 1)
-        name = k.strip()
-        value = v.strip()
-        if name:
-            out[name] = value
-    return out
-
-def _preferred_cookie_path_for_url(url: str) -> str:
-    path = urlsplit(str(url or "")).path or "/"
-    segs = [s for s in path.split("/") if s]
-    if segs:
-        return "/" + segs[0]
-    return "/"
-
-def _clear_cookie_name_from_client(client: httpx.AsyncClient, cookie_name: str) -> None:
-    jar = getattr(client.cookies, "jar", None)
-    if jar is None:
-        return
-
-    to_clear = []
-    try:
-        for c in list(jar):
-            if str(getattr(c, "name", "")).lower() == cookie_name.lower():
-                to_clear.append((
-                    getattr(c, "domain", None),
-                    getattr(c, "path", None),
-                    getattr(c, "name", None),
-                ))
-    except Exception:
-        return
-
-    for domain, path, name in to_clear:
-        try:
-            jar.clear(domain, path, name)
-        except Exception:
-            pass
-
-def _sanitize_request_headers_and_cookie_jar(
-    client: httpx.AsyncClient,
-    url: str,
-    headers: Dict[str, str],
-) -> Dict[str, str]:
-    safe_headers: Dict[str, str] = {}
-    for k, v in (headers or {}).items():
-        if str(k).lower() == "cookie":
-            continue
-        safe_headers[str(k)] = str(v)
-
-    manual_pairs = _parse_manual_auth_cookie_pairs()
-    preferred_path = _preferred_cookie_path_for_url(url)
-    host = (urlsplit(url).hostname or "").strip() or None
-
-    for name, value in manual_pairs.items():
-        if name.lower() not in SESSION_COOKIE_NAMES:
-            continue
-
-        _clear_cookie_name_from_client(client, name)
-
-        try:
-            if host:
-                client.cookies.set(name, value, domain=host, path=preferred_path)
-            else:
-                client.cookies.set(name, value, path=preferred_path)
-        except Exception:
-            pass
-
-    return safe_headers
 
 def scan_profile() -> str:
     return (os.getenv("SCAN_PROFILE") or "balanced").strip().lower()
@@ -179,43 +98,6 @@ def mask_headers(h: Dict[str, str]) -> Dict[str, str]:
             return {}
         return out
 
-
-# cookie
-def _snapshot_cookie_jar(client: httpx.AsyncClient) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-
-    try:
-        for cookie in client.cookies.jar:
-            name = str(getattr(cookie, "name", "") or "")
-            value = str(getattr(cookie, "value", "") or "")
-            if not name:
-                continue
-            out[name] = value
-    except Exception:
-        try:
-            for name in client.cookies.keys():
-                out[str(name)] = ""
-        except Exception:
-            pass
-
-    return out
-
-
-def _cookie_jar_delta(before: Dict[str, str], after: Dict[str, str]) -> Dict[str, Any]:
-    before_keys = set(before.keys())
-    after_keys = set(after.keys())
-
-    added = sorted(after_keys - before_keys)
-    removed = sorted(before_keys - after_keys)
-
-    return {
-        "cookie_jar_before_names": sorted(before_keys),
-        "cookie_jar_after_names": sorted(after_keys),
-        "cookie_jar_added_names": added,
-        "cookie_jar_removed_names": removed,
-        "cookie_jar_changed": bool(added or removed),
-        "cookie_jar_observed": bool(after_keys),
-    }
 
 def _redact_set_cookie_header(raw_cookie: str) -> str:
     return str(raw_cookie or "")
@@ -316,7 +198,7 @@ def _safe_set_cookie_objects_from_headers(headers: httpx.Headers) -> List[Dict[s
         out.append(
             {
                 "name": cookie_name,
-                "raw": raw,  # <- 이제 원문 그대로 저장
+                "raw": raw,  # Preserve the original raw Set-Cookie header value.
                 "value": first.split("=", 1)[1] if "=" in first else "",
                 "httponly": "httponly" in raw_l,
                 "secure": "secure" in raw_l,
@@ -474,7 +356,7 @@ def evaluate_auth_success(
     elif response.status_code >= 400:
         score -= 2
 
-    # 로그인 URL 그대로 + 로그인 페이지 같으면 강한 실패 신호
+    # Staying on the login URL and still looking like a login page is a strong failure signal.
     if final_url_l == login_url_l and looks_like_login_page(final_url, body):
         score -= 3
 
@@ -505,53 +387,13 @@ async def send_once(client: httpx.AsyncClient, spec: Any, timeout_s: float) -> D
             return mask_headers(out)
 
     def _preferred_cookie_path(url: str) -> str:
-        path = urlsplit(str(url or "")).path or "/"
-        segs = [s for s in path.split("/") if s]
-        if segs:
-            return "/" + segs[0]
-        return "/"
+        return preferred_cookie_path_for_url(url)
 
     def _parse_manual_auth_cookie_pairs() -> Dict[str, str]:
-        raw = str(os.getenv("MANUAL_AUTH_COOKIE", "") or "").strip()
-        out: Dict[str, str] = {}
-
-        if not raw:
-            return out
-
-        for part in raw.split(";"):
-            piece = str(part or "").strip()
-            if not piece or "=" not in piece:
-                continue
-            k, v = piece.split("=", 1)
-            name = k.strip()
-            value = v.strip()
-            if name:
-                out[name] = value
-
-        return out
+        return parse_manual_auth_cookie_pairs()
 
     def _clear_cookie_name_from_client(cookie_name: str) -> None:
-        jar = getattr(client.cookies, "jar", None)
-        if jar is None:
-            return
-
-        to_clear: List[tuple[Any, Any, Any]] = []
-        try:
-            for c in list(jar):
-                if str(getattr(c, "name", "") or "").lower() == cookie_name.lower():
-                    to_clear.append((
-                        getattr(c, "domain", None),
-                        getattr(c, "path", None),
-                        getattr(c, "name", None),
-                    ))
-        except Exception:
-            return
-
-        for domain, path, name in to_clear:
-            try:
-                jar.clear(domain, path, name)
-            except Exception:
-                pass
+        clear_cookie_name_from_client(client, cookie_name)
 
     def _sanitize_headers_and_reseed_session(url: str, headers: Dict[str, Any]) -> Dict[str, str]:
         safe_headers: Dict[str, str] = {}
@@ -559,7 +401,7 @@ async def send_once(client: httpx.AsyncClient, spec: Any, timeout_s: float) -> D
             ks = str(k or "").strip()
             if not ks:
                 continue
-            # Cookie는 header로 받지 않고 jar만 사용
+            # Never pass Cookie as a raw header here; use only the cookie jar.
             if ks.lower() == "cookie":
                 continue
             safe_headers[ks] = "" if v is None else str(v)
@@ -568,7 +410,7 @@ async def send_once(client: httpx.AsyncClient, spec: Any, timeout_s: float) -> D
         preferred_path = _preferred_cookie_path(url)
         host = (urlsplit(url).hostname or "").strip() or None
 
-        # JSESSIONID는 항상 하나만 유지
+        # Keep only one JSESSIONID value active at a time.
         manual_jsessionid = None
         for name, value in manual_pairs.items():
             if name.lower() == "jsessionid":
@@ -605,7 +447,7 @@ async def send_once(client: httpx.AsyncClient, spec: Any, timeout_s: float) -> D
         request_headers,
     )
 
-    cookies_before = _snapshot_cookie_jar(client)
+    cookies_before = snapshot_cookie_jar(client)
 
     request_meta = {
         "method": str(getattr(spec, "method", "") or "").upper(),
@@ -639,7 +481,7 @@ async def send_once(client: httpx.AsyncClient, spec: Any, timeout_s: float) -> D
         error_phase = "read_body"
         body_text = response.text or ""
         body_snippet = body_text[:8000]
-        cookies_after = _snapshot_cookie_jar(client)
+        cookies_after = snapshot_cookie_jar(client)
 
         redirect_chain = []
         for hist in response.history:
@@ -683,11 +525,11 @@ async def send_once(client: httpx.AsyncClient, spec: Any, timeout_s: float) -> D
         }
 
         snap = _attach_analysis_metadata(response, snap)
-        snap.update(_cookie_jar_delta(cookies_before, cookies_after))
+        snap.update(cookie_jar_delta(cookies_before, cookies_after))
         return snap
 
     except Exception as e:
-        cookies_after = _snapshot_cookie_jar(client)
+        cookies_after = snapshot_cookie_jar(client)
 
         headers_received = False
         if response is not None:
@@ -719,7 +561,7 @@ async def send_once(client: httpx.AsyncClient, spec: Any, timeout_s: float) -> D
             "set_cookie_present": False,
             "request": request_meta,
             "actual_request": request_meta,
-            **_cookie_jar_delta(cookies_before, cookies_after),
+            **cookie_jar_delta(cookies_before, cookies_after),
         }
 
 def _response_to_snapshot(resp: httpx.Response, elapsed_ms: int) -> Dict[str, Any]:
@@ -1255,7 +1097,7 @@ async def maybe_authenticate(
             body=None,
         )
 
-        cookies_before = _snapshot_cookie_jar(client)
+        cookies_before = snapshot_cookie_jar(client)
         start = time.time()
         try:
             resp = await client.post(
@@ -1269,8 +1111,8 @@ async def maybe_authenticate(
             continue
 
         post_snap = _response_to_snapshot(resp, int((time.time() - start) * 1000))
-        cookies_after = _snapshot_cookie_jar(client)
-        post_snap.update(_cookie_jar_delta(cookies_before, cookies_after))
+        cookies_after = snapshot_cookie_jar(client)
+        post_snap.update(cookie_jar_delta(cookies_before, cookies_after))
         auth_snapshots.append({"spec": post_spec, "snapshot": post_snap})
 
         auth_events.append(
@@ -1368,7 +1210,7 @@ async def maybe_authenticate(
                 body=None,
             )
 
-            cookies_before = _snapshot_cookie_jar(client)
+            cookies_before = snapshot_cookie_jar(client)
             start = time.time()
             try:
                 resp = await client.post(
@@ -1382,8 +1224,8 @@ async def maybe_authenticate(
                 continue
 
             post_snap = _response_to_snapshot(resp, int((time.time() - start) * 1000))
-            cookies_after = _snapshot_cookie_jar(client)
-            post_snap.update(_cookie_jar_delta(cookies_before, cookies_after))
+            cookies_after = snapshot_cookie_jar(client)
+            post_snap.update(cookie_jar_delta(cookies_before, cookies_after))
             auth_snapshots.append({"spec": post_spec, "snapshot": post_snap})
 
             auth_events.append(
@@ -1537,8 +1379,8 @@ def should_skip_probe_for_scope(scope_state: Dict[str, Any], spec: Any) -> bool:
     url = str(getattr(spec, "url", "") or "")
     cat = probe_category(spec)
 
-    # 고가치 HTTP surface 는 계속 더 본다.
-    # 특히 header finding 하나 떴다고 body/resource probing 을 막지 않는다.
+    # Keep probing high-value HTTP surfaces.
+    # A single header finding should not block body, resource, or error probing.
     if _is_high_value_http_surface(url):
         if cat in {
             "cors_behavior",
@@ -1554,7 +1396,7 @@ def should_skip_probe_for_scope(scope_state: Dict[str, Any], spec: Any) -> bool:
             return False
 
     # ---------------------------------------------------------
-    # 이미 충분히 찾은 category 는 중복 probe를 줄인다.
+    # Reduce duplicate probes once a category has already been observed well enough.
     # ---------------------------------------------------------
     if scope_state.get("error_disclosure_found") and cat == "error_mutation":
         return True
@@ -1569,14 +1411,14 @@ def should_skip_probe_for_scope(scope_state: Dict[str, Any], spec: Any) -> bool:
         return True
 
     # ---------------------------------------------------------
-    # system info 관련 정책
+    # System information probing policy
     #
-    # 1) header disclosure만 찾은 경우:
-    #    - header_mutation 은 일부 줄여도 되지만
-    #    - body/resource/error 쪽은 계속 본다
+    # 1) If only header disclosure has been observed:
+    #    - reduce some header mutations
+    #    - but keep body, resource, and error probing active
     #
-    # 2) body disclosure/concrete exposure까지 찾은 경우:
-    #    - header_mutation / body_behavior / 일부 error_mutation 중복을 줄인다
+    # 2) If body disclosure or concrete exposure has been observed:
+    #    - reduce duplicate header_mutation, body_behavior, and some error_mutation probes
     # ---------------------------------------------------------
     if scope_state.get("system_info_header_found") and cat == "header_mutation":
         return True
@@ -1632,237 +1474,6 @@ def update_scope_state_from_candidate(scope_state: Dict[str, Any], cand: Dict[st
 
     if ctype == "DIRECTORY_LISTING_ENABLED":
         scope_state["directory_listing_found"] = True
-
-def _candidate_status_code(candidate: Dict[str, Any], first_snapshot: Dict[str, Any]) -> int | None:
-    evidence = candidate.get("evidence") or {}
-    return candidate.get("status_code") or evidence.get("status_code") or first_snapshot.get("status_code")
-
-
-def _candidate_redirect_location(candidate: Dict[str, Any], first_snapshot: Dict[str, Any]) -> str:
-    evidence = candidate.get("evidence") or {}
-    location = str(evidence.get("location") or "")
-    if location:
-        return location
-
-    headers = first_snapshot.get("headers") or {}
-    for k, v in headers.items():
-        if str(k).lower() == "location":
-            return str(v or "")
-    return ""
-
-
-def _is_concrete_exposure_type(ctype: str) -> bool:
-    return ctype in {
-        "PHPINFO_EXPOSURE",
-        "HTTP_CONFIG_FILE_EXPOSURE",
-        "LOG_VIEWER_EXPOSURE",
-    }
-
-def _has_concrete_body_exposure(candidate: Dict[str, Any]) -> bool:
-    evidence = candidate.get("evidence") or {}
-    ctype = str(candidate.get("type") or "")
-
-    if ctype == "PHPINFO_EXPOSURE":
-        indicators = evidence.get("phpinfo_indicators") or []
-        return len(indicators) >= 2
-
-    if ctype == "HTTP_CONFIG_FILE_EXPOSURE":
-        markers = [
-            str(x).strip().lower()
-            for x in (evidence.get("config_exposure_markers") or [])
-            if str(x).strip()
-        ]
-        body_hint = str(evidence.get("body_content_type_hint") or "").lower()
-        final_url = str(evidence.get("final_url") or "").lower()
-
-        strong_tokens = {
-            "db_password",
-            "mysql_password",
-            "db_user",
-            "db_host",
-            "database",
-            "connection_string",
-            "api_key",
-            "access_key",
-            "aws_access_key",
-            "aws_secret",
-            "private_key",
-        }
-
-        config_like_path = any(
-            tok in final_url
-            for tok in (
-                ".env",
-                ".ini",
-                ".conf",
-                ".cfg",
-                ".yaml",
-                ".yml",
-                ".json",
-                ".xml",
-                ".properties",
-                "config",
-                "settings",
-                "appsettings",
-                "database",
-            )
-        )
-        config_like_body = body_hint in {"json", "json_like", "yaml", "yaml_like", "xml", "xml_like"}
-
-        if len(set(markers).intersection(strong_tokens)) >= 1 and (config_like_path or config_like_body):
-            return True
-        if len(markers) >= 3 and config_like_body:
-            return True
-        return False
-
-    if ctype == "LOG_VIEWER_EXPOSURE":
-        patterns = evidence.get("log_exposure_patterns") or []
-        return len(patterns) >= 2
-
-    if ctype == "FILE_PATH_HANDLING_ANOMALY":
-        return any(
-            evidence.get(k)
-            for k in ("file_paths", "stack_traces", "db_errors", "debug_hints")
-        )
-
-    return False
-
-
-
-def _is_direct_200_exposure(first_snapshot: Dict[str, Any]) -> bool:
-    if not first_snapshot.get("ok"):
-        return False
-    if first_snapshot.get("status_code") != 200:
-        return False
-
-    final_url = str(first_snapshot.get("final_url") or "").lower()
-    headers = first_snapshot.get("headers") or {}
-
-    location = ""
-    for k, v in headers.items():
-        if str(k).lower() == "location":
-            location = str(v or "").lower()
-            break
-
-    if any(x in final_url for x in ("login", "signin", "/auth", "/sso")):
-        return False
-    if any(x in location for x in ("login", "signin", "/auth", "/sso")):
-        return False
-
-    return True
-
-
-def _body_text_from_snapshot(snapshot: Dict[str, Any]) -> str:
-    return str(snapshot.get("body_text") or snapshot.get("body_snippet") or "")
-
-def _has_error_like_exposure(candidate: Dict[str, Any], snapshot: Dict[str, Any]) -> bool:
-    evidence = candidate.get("evidence") or {}
-    body_l = _body_text_from_snapshot(snapshot).lower()
-
-    if evidence.get("error_exposure_class"):
-        return True
-    if evidence.get("stack_traces"):
-        return True
-    if evidence.get("file_paths"):
-        return True
-    if evidence.get("db_errors"):
-        return True
-    if evidence.get("debug_hints"):
-        return True
-
-    return any(
-        token in body_l
-        for token in (
-            "fatal error",
-            "stack trace",
-            "traceback",
-            "uncaught exception",
-            "exception report",
-        )
-    )
-
-def _has_concrete_default_resource_exposure(candidate: Dict[str, Any], snapshot: Dict[str, Any]) -> bool:
-    evidence = candidate.get("evidence") or {}
-    subtype = str(candidate.get("subtype") or "")
-    body = _body_text_from_snapshot(snapshot)
-    body_l = body.lower()
-
-    if not _is_direct_200_exposure(snapshot):
-        return False
-
-    if _has_error_like_exposure(candidate, snapshot):
-        return False
-
-    if subtype == "phpinfo_page":
-        indicators = evidence.get("phpinfo_indicators") or []
-        return len(indicators) >= 2
-
-    if subtype == "git_metadata":
-        return any(
-            marker in body_l
-            for marker in (
-                "[core]",
-                "repositoryformatversion",
-                "filemode = ",
-                'remote "origin"',
-                "bare = ",
-            )
-        )
-
-    if subtype == "server_status":
-        return any(
-            marker in body_l
-            for marker in (
-                "apache server status",
-                "server uptime",
-                "total accesses",
-                "scoreboard",
-            )
-        )
-
-    if subtype == "env_file":
-        env_like_lines = 0
-        for line in body.splitlines():
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", s):
-                env_like_lines += 1
-                if env_like_lines >= 2:
-                    return True
-        return False
-
-    if subtype in {"actuator_endpoint", "debug_endpoint"}:
-        if body_l.startswith("{") and any(k in body_l for k in ('"status"', '"_links"', '"health"', '"components"')):
-            return True
-        if "debug toolbar" in body_l:
-            return True
-        return False
-
-    return bool(evidence.get("default_file_hints") or [])
-
-def _should_downgrade_weak_resource_signal(candidate: Dict[str, Any], first_snapshot: Dict[str, Any]) -> bool:
-    ctype = str(candidate.get("type") or "")
-    status_code = _candidate_status_code(candidate, first_snapshot)
-    location = _candidate_redirect_location(candidate, first_snapshot).lower()
-
-    if ctype == "DEFAULT_FILE_EXPOSED":
-        if status_code in {301, 302, 303, 307, 308, 401, 403, 404}:
-            return True
-        if any(x in location for x in ("login", "signin", "/auth", "/sso")):
-            return True
-        return not _has_concrete_default_resource_exposure(candidate, first_snapshot)
-
-    if ctype == "FILE_PATH_HANDLING_ANOMALY":
-        return not _has_concrete_body_exposure(candidate)
-
-    if ctype in {"PHPINFO_EXPOSURE", "HTTP_CONFIG_FILE_EXPOSURE", "LOG_VIEWER_EXPOSURE"}:
-        if _is_direct_200_exposure(first_snapshot) and _has_concrete_body_exposure(candidate):
-            return False
-        return True
-
-    return False
-
 
 def _build_request_meta(spec: Any) -> Dict[str, Any]:
     def _safe_str(value: Any) -> str | None:
@@ -1953,7 +1564,7 @@ def _store_with_verdict_precedence(
         _merge_into_bucket(confirmed_map, key, cand)
         return
 
-    # INFORMATIONAL / INCONCLUSIVE 는 false_positive가 아니라 informational 쪽으로 둔다
+    # INFORMATIONAL / INCONCLUSIVE findings should stay in the informational bucket, not false_positive.
     if verdict_norm in {"INFORMATIONAL", "INCONCLUSIVE"}:
         if key in confirmed_map:
             return
@@ -1967,406 +1578,12 @@ def _store_with_verdict_precedence(
         _merge_into_bucket(false_positive_map, key, cand)
         return
 
-    # verdict가 비어있거나 알 수 없으면 false_positive로 보내지 말고 informational로 둔다
+    # If the verdict is empty or unknown, keep it informational instead of marking it false positive.
     if key in confirmed_map:
         return
 
     false_positive_map.pop(key, None)
     _merge_into_bucket(informational_map, key, cand)
-
-def _normalize_risky_http_methods_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
-    if str(finding.get("type") or "") != "RISKY_HTTP_METHODS_ENABLED":
-        return finding
-
-    finding = dict(finding)
-    evidence = finding.setdefault("evidence", {})
-    verification = finding.setdefault("verification", {})
-
-    final_methods = sorted({
-        str(m).upper().strip()
-        for m in (evidence.get("risky_methods_enabled") or [])
-        if str(m).strip() and str(m).upper().strip() != "TRACE"
-    })
-
-    evidence["risky_methods_enabled"] = final_methods
-    evidence["method_capability_signals"] = list(dict.fromkeys(
-        str(s).strip()
-        for s in (evidence.get("method_capability_signals") or [])
-        if str(s).strip()
-    ))
-
-    finding["root_cause_signature"] = "methods:" + ",".join(final_methods)
-    finding["title"] = "Risky HTTP methods appear enabled"
-    finding["severity"] = "Info"
-    finding["final_severity"] = "Info"
-    verification["verdict"] = "INFORMATIONAL"
-    verification["reason"] = (
-        "Observed risky HTTP methods in server handling or allow headers. "
-        "Actual upload/delete capability is tracked as separate findings."
-    )
-    finding["reason"] = verification["reason"]
-
-    finding["exposed_information"] = [
-        *[f"Allowed or handled risky method: {m}" for m in final_methods],
-        f"Observed methods: {', '.join(final_methods)}" if final_methods else "Observed risky methods in headers/behavior",
-    ]
-    return finding
-
-
-def _normalize_put_upload_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
-    if str(finding.get("type") or "") != "HTTP_PUT_UPLOAD_CAPABILITY":
-        return finding
-
-    finding = dict(finding)
-    evidence = finding.setdefault("evidence", {})
-    verification = finding.setdefault("verification", {})
-
-    finding["title"] = "HTTP PUT allows upload to a web-accessible location"
-    finding["severity"] = "Medium"
-    finding["final_severity"] = "Medium"
-    finding["root_cause_signature"] = f"put-upload:{evidence.get('candidate_url') or finding.get('where') or ''}"
-
-    if verification.get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE"}:
-        verification["verdict"] = "CONFIRMED"
-    verification["reason"] = (
-        "A canary resource was uploaded with HTTP PUT and then retrieved successfully from the same location."
-    )
-    finding["reason"] = verification["reason"]
-
-    finding["exposed_information"] = [
-        f"PUT upload target: {evidence.get('candidate_url') or finding.get('where') or ''}",
-        f"PUT status: {evidence.get('put_status')}",
-        f"GET verification status: {evidence.get('get_status')}",
-        "Uploaded marker was retrieved successfully.",
-    ]
-    return finding
-
-
-def _normalize_delete_capability_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
-    if str(finding.get("type") or "") != "HTTP_DELETE_CAPABILITY":
-        return finding
-
-    finding = dict(finding)
-    evidence = finding.setdefault("evidence", {})
-    verification = finding.setdefault("verification", {})
-
-    finding["title"] = "HTTP DELETE can remove a web-accessible resource"
-    finding["severity"] = "Medium"
-    finding["final_severity"] = "Medium"
-    finding["root_cause_signature"] = f"delete-capability:{evidence.get('candidate_url') or finding.get('where') or ''}"
-
-    if verification.get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE"}:
-        verification["verdict"] = "CONFIRMED"
-    verification["reason"] = (
-        "A canary resource created by the scanner was deleted with HTTP DELETE and its removal was verified."
-    )
-    finding["reason"] = verification["reason"]
-
-    finding["exposed_information"] = [
-        f"DELETE target: {evidence.get('candidate_url') or finding.get('where') or ''}",
-        f"DELETE status: {evidence.get('delete_status')}",
-        f"Post-delete verification status: {evidence.get('verify_delete_status')}",
-        "Deleted canary resource was no longer accessible.",
-    ]
-    return finding
-
-
-def _normalize_method_capability_candidates(items: Any) -> List[Dict[str, Any]]:
-    if isinstance(items, list):
-        raw_items = items
-    elif isinstance(items, dict):
-        raw_items = [items]
-    else:
-        raw_items = []
-
-    out: List[Dict[str, Any]] = []
-    for item in raw_items:
-        if not isinstance(item, dict):
-            continue
-
-        ctype = str(item.get("type") or "")
-        if ctype == "RISKY_HTTP_METHODS_ENABLED":
-            out.append(_normalize_risky_http_methods_finding(item))
-        elif ctype == "HTTP_PUT_UPLOAD_CAPABILITY":
-            out.append(_normalize_put_upload_finding(item))
-        elif ctype == "HTTP_DELETE_CAPABILITY":
-            out.append(_normalize_delete_capability_finding(item))
-        else:
-            out.append(item)
-    return out
-
-async def _verify_cors_misconfig_active(
-    *,
-    client: httpx.AsyncClient,
-    candidate: Dict[str, Any],
-    timeout_s: float,
-) -> Dict[str, Any]:
-    candidate = dict(candidate)
-    candidate.setdefault("verification", {})
-    evidence = dict(candidate.get("evidence") or {})
-    final_url = str(
-        evidence.get("final_url")
-        or (candidate.get("trigger") or {}).get("url")
-        or candidate.get("where")
-        or ""
-    ).strip()
-
-    if not final_url.startswith(("http://", "https://")):
-        if candidate["verification"].get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE"}:
-            candidate["verification"]["verdict"] = "INFORMATIONAL"
-            candidate["verification"]["reason"] = "CORS validation skipped because no concrete URL was available."
-        candidate["reproduction_attempts"] = 1
-        return candidate
-
-    probe_origin = "https://evil.example"
-    attempts = []
-
-    async def _send(kind: str, headers: Dict[str, str]) -> Dict[str, Any]:
-        try:
-            r = await client.get(
-                final_url,
-                headers=headers,
-                follow_redirects=False,
-                timeout=timeout_s,
-            )
-            return {
-                "kind": kind,
-                "status_code": r.status_code,
-                "acao": r.headers.get("Access-Control-Allow-Origin"),
-                "acac": r.headers.get("Access-Control-Allow-Credentials"),
-                "vary": r.headers.get("Vary"),
-            }
-        except Exception as e:
-            return {
-                "kind": kind,
-                "error": f"{type(e).__name__}: {e}",
-            }
-
-    attempts.append(await _send("evil_origin", {"Origin": probe_origin}))
-    attempts.append(await _send("evil_origin_with_cookie", {"Origin": probe_origin, "Cookie": "oai_test=1"}))
-
-    confirmed = False
-    high_risk = False
-
-    for a in attempts:
-        acao = str(a.get("acao") or "").strip()
-        acac = str(a.get("acac") or "").strip().lower()
-
-        reflected = acao == probe_origin
-        wildcard = acao == "*"
-        creds_true = acac == "true"
-
-        if reflected and creds_true:
-            confirmed = True
-            high_risk = True
-            break
-
-        if wildcard and creds_true:
-            confirmed = True
-            high_risk = True
-            break
-
-        if reflected:
-            confirmed = True
-
-    evidence["active_cors_validation"] = attempts
-    evidence["active_probe_origin"] = probe_origin
-    candidate["evidence"] = evidence
-
-    if confirmed:
-        candidate["verification"]["verdict"] = "CONFIRMED"
-        if high_risk:
-            candidate["verification"]["reason"] = (
-                "CORS policy was actively confirmed with attacker-controlled Origin and credentialed cross-origin access characteristics."
-            )
-            candidate["severity"] = "High"
-            candidate["final_severity"] = "High"
-        else:
-            candidate["verification"]["reason"] = (
-                "CORS policy was actively confirmed with attacker-controlled Origin reflection."
-            )
-            if str(candidate.get("severity") or "") not in {"High"}:
-                candidate["severity"] = "Medium"
-                candidate["final_severity"] = "Medium"
-    else:
-        if candidate["verification"].get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE"}:
-            candidate["verification"]["verdict"] = "FALSE_POSITIVE"
-            candidate["verification"]["reason"] = (
-                "Initial CORS signal was not reproduced during active validation with attacker-controlled Origin."
-            )
-
-    candidate["reproduction_attempts"] = len(attempts)
-    return candidate
-
-async def reproduce_verify(
-    client: httpx.AsyncClient,
-    spec: Any,
-    timeout_s: float,
-    retries: int,
-    candidate: Dict[str, Any],
-    first_snapshot: Dict[str, Any],
-    stable_key_fn,
-) -> Dict[str, Any] | List[Dict[str, Any]]:
-    candidate.setdefault("verification", {})
-
-    profile = scan_profile()
-    fast_repro_mode = profile == "fast"
-    ctype = str(candidate.get("type") or "")
-
-    # --------------------------------------------------
-    # specialized verification paths
-    # --------------------------------------------------
-    if ctype == "RISKY_HTTP_METHODS_ENABLED":
-        verified = await verify_risky_http_methods_capability(
-            client=client,
-            candidate=candidate,
-            timeout_s=timeout_s,
-        )
-        if isinstance(verified, dict):
-            verified["reproduction_attempts"] = max(1, int(verified.get("reproduction_attempts") or 0))
-        elif isinstance(verified, list):
-            for item in verified:
-                if isinstance(item, dict):
-                    item["reproduction_attempts"] = max(1, int(item.get("reproduction_attempts") or 0))
-        return verified
-
-    if ctype == "CORS_MISCONFIG":
-        return await _verify_cors_misconfig_active(
-            client=client,
-            candidate=candidate,
-            timeout_s=timeout_s,
-        )
-
-    # --------------------------------------------------
-    # fast-path direct concrete exposure
-    # --------------------------------------------------
-    if _is_concrete_exposure_type(ctype):
-        if _is_direct_200_exposure(first_snapshot) and _has_concrete_body_exposure(candidate):
-            candidate["verification"]["verdict"] = "CONFIRMED"
-            candidate["verification"]["reason"] = (
-                "Concrete diagnostic/config/log exposure directly observed in a 200 response."
-            )
-            candidate["reproduction_attempts"] = 1
-            return candidate
-
-    if ctype == "DEFAULT_FILE_EXPOSED":
-        if _is_direct_200_exposure(first_snapshot) and _has_concrete_default_resource_exposure(candidate, first_snapshot):
-            candidate["verification"]["verdict"] = "CONFIRMED"
-            candidate["verification"]["reason"] = (
-                "Direct default/sensitive resource exposure was observed with concrete content markers."
-            )
-            candidate["reproduction_attempts"] = 1
-            return candidate
-
-    # --------------------------------------------------
-    # downgrade weak resource-like signals early
-    # --------------------------------------------------
-    if _should_downgrade_weak_resource_signal(candidate, first_snapshot):
-        if candidate["verification"].get("verdict") != "FALSE_POSITIVE":
-            candidate["verification"]["verdict"] = "INFORMATIONAL"
-            candidate["verification"]["reason"] = (
-                "Observed path signal was reproducible enough to keep, but it did not prove concrete exposure."
-            )
-        candidate["reproduction_attempts"] = 1
-        return candidate
-
-    if should_mark_manual_review(candidate):
-        if candidate["verification"].get("verdict") != "FALSE_POSITIVE":
-            candidate["verification"]["verdict"] = "INFORMATIONAL"
-            candidate["verification"]["reason"] = (
-                "Weak or ambiguous signal kept informational without reproduce escalation."
-            )
-        candidate["reproduction_attempts"] = 1
-        return candidate
-
-    deterministic_header_types = {
-        "CLICKJACKING",
-        "HSTS_MISSING",
-        "CSP_MISSING",
-        "CONTENT_TYPE_SNIFFING",
-        "REFERRER_POLICY_MISSING",
-        "PERMISSIONS_POLICY_MISSING",
-        "COOKIE_HTTPONLY_MISSING",
-        "COOKIE_SECURE_MISSING",
-        "COOKIE_SAMESITE_MISSING",
-    }
-
-    if ctype in deterministic_header_types:
-        if candidate["verification"].get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE", "INFORMATIONAL"}:
-            candidate["verification"]["verdict"] = "CONFIRMED"
-            candidate["verification"]["reason"] = (
-                "Confirmed from response headers in a deterministic single-response check."
-            )
-        candidate["reproduction_attempts"] = 1
-        return candidate
-
-    if should_skip_reproduce(candidate):
-        if candidate["verification"].get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE", "INFORMATIONAL"}:
-            candidate["verification"]["verdict"] = "CONFIRMED"
-            candidate["verification"]["reason"] = (
-                "Confirmed from a deterministic single-response signal; reproduce step skipped."
-            )
-        candidate["reproduction_attempts"] = 1
-        return candidate
-
-    # --------------------------------------------------
-    # generic reproduce
-    # --------------------------------------------------
-    if fast_repro_mode:
-        effective_retries = 1
-        sleep_s = 0.0
-    else:
-        effective_retries = max(1, retries)
-        sleep_s = float(os.getenv("REPRODUCE_RETRY_SLEEP_SECONDS", "0.2"))
-
-    attempts = [first_snapshot]
-
-    for i in range(effective_retries):
-        if sleep_s > 0:
-            await asyncio.sleep(sleep_s * (i + 1))
-        attempts.append(await send_once(client, spec, timeout_s))
-
-    target_key = stable_key_fn(candidate)
-    reproduced = False
-
-    for snap in attempts[1:]:
-        if not snap.get("ok"):
-            continue
-
-        req_meta = _build_request_meta(spec)
-        feats = extract_features(req_meta, snap)
-        reproduced_candidates = generate_candidates(req_meta, snap, feats)
-
-        if any(stable_key_fn(c) == target_key for c in reproduced_candidates):
-            reproduced = True
-            break
-
-    if candidate["verification"].get("verdict") == "FALSE_POSITIVE":
-        return candidate
-
-    if reproduced:
-        if candidate["verification"].get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE"}:
-            candidate["verification"]["verdict"] = "CONFIRMED"
-            candidate["verification"]["reason"] = "Reproduced across repeated requests with stable evidence."
-    else:
-        if _is_concrete_exposure_type(ctype):
-            if candidate["verification"].get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE"}:
-                candidate["verification"]["verdict"] = "INFORMATIONAL"
-                candidate["verification"]["reason"] = (
-                    "Concrete exposure markers were observed once, but repeat reproduction was not stable."
-                )
-        else:
-            if fast_repro_mode:
-                if candidate["verification"].get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE"}:
-                    candidate["verification"]["verdict"] = "INFORMATIONAL"
-                    candidate["verification"]["reason"] = "Not reproduced in fast verification mode."
-            else:
-                if candidate["verification"].get("verdict") not in {"INFORMATIONAL", "FALSE_POSITIVE", "CONFIRMED"}:
-                    candidate["verification"]["verdict"] = "FALSE_POSITIVE"
-                    candidate["verification"]["reason"] = "Not consistently reproduced."
-
-    candidate["reproduction_attempts"] = len(attempts)
-    return candidate
 
 async def _finalize_candidate(
     *,
@@ -2385,8 +1602,6 @@ async def _finalize_candidate(
         cand = await llm_judge_if_enabled_fn(cand, snap)
 
     candidate_type = str(cand.get("type") or "")
-    candidate_family = str(cand.get("family") or "")
-    evidence = cand.get("evidence") or {}
 
     # --------------------------------------------------
     # capability findings branch
@@ -2400,6 +1615,9 @@ async def _finalize_candidate(
             candidate=cand,
             first_snapshot=snap,
             stable_key_fn=stable_key_fn,
+            scan_profile_fn=scan_profile,
+            send_once_fn=send_once,
+            build_request_meta_fn=_build_request_meta,
         )
 
         out: List[Dict[str, Any]] = []
@@ -2411,69 +1629,9 @@ async def _finalize_candidate(
 
     cand = validate_candidate_after_llm(cand)
 
-    # --------------------------------------------------
-    # header-only system info: keep informational
-    # --------------------------------------------------
-    if candidate_type == "HTTP_SYSTEM_INFO_EXPOSURE" and candidate_family == "HTTP_HEADER_DISCLOSURE":
-        cand.setdefault("verification", {})
-        if cand["verification"].get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE", "INFORMATIONAL"}:
-            cand["verification"]["verdict"] = "INFORMATIONAL"
-            cand["verification"]["reason"] = (
-                "Header-based system information disclosure observed in a stable response."
-            )
-        cand["reproduction_attempts"] = 1
-        return [validate_candidate_after_llm(cand)]
-
-    # --------------------------------------------------
-    # weak body-only system info: keep informational
-    # --------------------------------------------------
-    if candidate_type == "HTTP_SYSTEM_INFO_EXPOSURE" and candidate_family == "HTTP_BODY_DISCLOSURE":
-        strong_versions = evidence.get("strong_version_tokens_in_body") or []
-        internal_ips = evidence.get("internal_ips") or []
-
-        if not strong_versions and not internal_ips:
-            cand.setdefault("verification", {})
-            if cand["verification"].get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE", "INFORMATIONAL"}:
-                cand["verification"]["verdict"] = "INFORMATIONAL"
-                cand["verification"]["reason"] = (
-                    "Weak body fingerprint was kept informational and not escalated."
-                )
-            cand["reproduction_attempts"] = 1
-            return [validate_candidate_after_llm(cand)]
-
-    # --------------------------------------------------
-    # direct concrete observation short-circuit
-    # --------------------------------------------------
-    if candidate_type in {"PHPINFO_EXPOSURE", "HTTP_CONFIG_FILE_EXPOSURE", "LOG_VIEWER_EXPOSURE"}:
-        if _is_direct_200_exposure(snap) and _has_concrete_body_exposure(cand):
-            cand.setdefault("verification", {})
-            cand["verification"]["verdict"] = "CONFIRMED"
-            cand["verification"]["reason"] = (
-                "Concrete diagnostic/config/log exposure directly observed in a 200 response."
-            )
-            cand["reproduction_attempts"] = 1
-            return [validate_candidate_after_llm(cand)]
-
-    if candidate_type == "DEFAULT_FILE_EXPOSED":
-        if _is_direct_200_exposure(snap) and _has_concrete_default_resource_exposure(cand, snap):
-            cand.setdefault("verification", {})
-            cand["verification"]["verdict"] = "CONFIRMED"
-            cand["verification"]["reason"] = (
-                "Direct default or sensitive resource exposure was observed with concrete content markers."
-            )
-            cand["reproduction_attempts"] = 1
-            return [validate_candidate_after_llm(cand)]
-
-    if candidate_type == "HTTP_ERROR_INFO_EXPOSURE":
-        if _has_error_like_exposure(cand, snap):
-            cand.setdefault("verification", {})
-            if cand["verification"].get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE", "INFORMATIONAL"}:
-                cand["verification"]["verdict"] = "INFORMATIONAL"
-                cand["verification"]["reason"] = (
-                    "Error disclosure indicators were directly observed in the response."
-                )
-            cand["reproduction_attempts"] = 1
-            return [validate_candidate_after_llm(cand)]
+    direct_finalized = try_direct_finalize_candidate(cand, snap)
+    if direct_finalized is not None:
+        return [validate_candidate_after_llm(direct_finalized)]
 
     # --------------------------------------------------
     # reproduce path
@@ -2487,6 +1645,9 @@ async def _finalize_candidate(
             candidate=cand,
             first_snapshot=snap,
             stable_key_fn=stable_key_fn,
+            scan_profile_fn=scan_profile,
+            send_once_fn=send_once,
+            build_request_meta_fn=_build_request_meta,
         )
 
         if isinstance(finalized, list):
@@ -2504,30 +1665,7 @@ async def _finalize_candidate(
     # --------------------------------------------------
     # no reproduce path
     # --------------------------------------------------
-    cand.setdefault("verification", {})
-    if cand["verification"].get("verdict") not in {"CONFIRMED", "FALSE_POSITIVE", "INFORMATIONAL"}:
-        if candidate_type in {"HTTP_SYSTEM_INFO_EXPOSURE", "HTTP_ERROR_INFO_EXPOSURE"}:
-            cand["verification"]["verdict"] = "INFORMATIONAL"
-            cand["verification"]["reason"] = (
-                "Observed directly in a single response without reproduce escalation."
-            )
-        else:
-            cand["verification"]["verdict"] = "CONFIRMED"
-            cand["verification"]["reason"] = (
-                "Confirmed from a deterministic or strong single-response signal; reproduce step skipped."
-            )
-
-    cand["reproduction_attempts"] = 1
-    cand = validate_candidate_after_llm(cand)
-
-    if str(cand.get("type") or "") == "HTTP_CONFIG_FILE_EXPOSURE":
-        verdict = str((cand.get("verification") or {}).get("verdict") or "").upper()
-        if verdict == "CONFIRMED":
-            cand["title"] = "Configuration file exposure via HTTP parameter"
-        elif verdict == "INFORMATIONAL":
-            cand["title"] = "Potential configuration file exposure via HTTP parameter"
-
-    return [cand]
+    return [validate_candidate_after_llm(finalize_without_reproduce(cand))]
 
 
 async def process_plan(
@@ -2703,7 +1841,7 @@ async def process_plan(
                 "request_headers": req_shape["headers"],
                 "request_body_len": req_shape["body_len"],
                 "request_body_present": req_shape["has_body"],
-                "request_body_text": req_shape["body_text"],   # 추가
+                "request_body_text": req_shape["body_text"],   # Added for replay diagnostics.
             }
         )
 

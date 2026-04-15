@@ -18,6 +18,13 @@ from agent.crawler import (
     classify_url_kind,
 )
 from agent.features import extract_features
+from agent.finding_types import (
+    AMBIGUOUS_TYPES,
+    DETERMINISTIC_TYPES,
+    INFORMATION_DISCLOSURE_TYPES,
+    OWASP_ONLY_NO_CWE_MAPPING,
+    SECURITY_MISCONFIGURATION_TYPES,
+)
 from agent.finding_store import (
     ensure_output_dirs,
     merge_finding,
@@ -34,14 +41,19 @@ from agent.probes import (
     build_object_access_control_replay_plan,
     build_authenticated_business_probe_plan,
 )
-from agent.report_generator import generate_reports
+from agent.reporting.report_generator import generate_reports
+from agent.runtime.scan_summary import (
+    add_confirmed_counts_to_coverage,
+    compute_summary,
+    finalize_coverage_assessment,
+    finding_group,
+)
 from agent.scan_engine import (
     _build_request_meta,
     _finalize_candidate,
     _store_with_verdict_precedence,
     maybe_authenticate,
     process_plan,
-    _sanitize_request_headers_and_cookie_jar,
 )
 
 from agent.verification_policy import (
@@ -60,9 +72,12 @@ from agent.scope import (
     route_scope_url,
 )
 from agent.severity_engine import apply_base_severity_to_candidates
-
-
-OWASP_ONLY_NO_CWE_MAPPING = "OWASP_ONLY_NO_CWE_MAPPING"
+from agent.http.http_session import (
+    clear_cookie_name_from_client as clear_cookie_name_from_http_client,
+    parse_manual_auth_cookie_pairs,
+    preferred_cookie_path_for_url,
+    sanitize_request_headers_and_cookie_jar,
+)
 
 LOW_VALUE_FILE_HINTS = (
     "readme",
@@ -79,62 +94,6 @@ LOW_VALUE_EXTS = (
     ".txt",
 )
 
-INFORMATION_DISCLOSURE_TYPES = {
-    "HTTP_ERROR_INFO_EXPOSURE",
-    "HTTP_SYSTEM_INFO_EXPOSURE",
-    "DIRECTORY_LISTING_ENABLED",
-    "DEFAULT_FILE_EXPOSED",
-    "PHPINFO_EXPOSURE",
-    "HTTP_CONFIG_FILE_EXPOSURE",
-    "LOG_VIEWER_EXPOSURE",
-    "FILE_PATH_HANDLING_ANOMALY",
-}
-
-SECURITY_MISCONFIGURATION_TYPES = {
-    "SECURITY_HEADERS_MISSING",
-    "CORS_MISCONFIG",
-    "COOKIE_HTTPONLY_MISSING",
-    "COOKIE_SECURE_MISSING",
-    "COOKIE_SAMESITE_MISSING",
-    "TRACE_ENABLED",
-    "RISKY_HTTP_METHODS_ENABLED",
-    "HTTPS_REDIRECT_MISSING",
-    "HSTS_MISSING",
-    "OPEN_REDIRECT",
-    "CLICKJACKING",
-    "CSP_MISSING",
-    "CONTENT_TYPE_SNIFFING",
-    "REFERRER_POLICY_MISSING",
-    "PERMISSIONS_POLICY_MISSING",
-}
-
-AMBIGUOUS_TYPES = {
-    "HTTP_ERROR_INFO_EXPOSURE",
-    "HTTP_SYSTEM_INFO_EXPOSURE",
-    "PHPINFO_EXPOSURE",
-    "HTTP_CONFIG_FILE_EXPOSURE",
-    "LOG_VIEWER_EXPOSURE",
-    "FILE_PATH_HANDLING_ANOMALY",
-}
-
-DETERMINISTIC_TYPES = {
-    "DIRECTORY_LISTING_ENABLED",
-    "DEFAULT_FILE_EXPOSED",
-    "CORS_MISCONFIG",
-    "COOKIE_HTTPONLY_MISSING",
-    "COOKIE_SECURE_MISSING",
-    "COOKIE_SAMESITE_MISSING",
-    "TRACE_ENABLED",
-    "RISKY_HTTP_METHODS_ENABLED",
-    "HTTPS_REDIRECT_MISSING",
-    "HSTS_MISSING",
-    "CLICKJACKING",
-    "CSP_MISSING",
-    "CONTENT_TYPE_SNIFFING",
-    "REFERRER_POLICY_MISSING",
-    "PERMISSIONS_POLICY_MISSING",
-}
-
 SESSION_COOKIE_NAMES = {
     "jsessionid",
     "phpsessid",
@@ -146,34 +105,10 @@ SESSION_COOKIE_NAMES = {
 }
 
 def _preferred_cookie_path(url: str) -> str:
-    path = urlsplit(str(url or "")).path or "/"
-    segs = [s for s in path.split("/") if s]
-    if segs:
-        return "/" + segs[0]
-    return "/"
+    return preferred_cookie_path_for_url(url)
 
 def _clear_cookie_name_from_client(client: httpx.AsyncClient, cookie_name: str) -> None:
-    jar = getattr(client.cookies, "jar", None)
-    if jar is None:
-        return
-
-    to_clear = []
-    try:
-        for c in list(jar):
-            if str(getattr(c, "name", "")).lower() == cookie_name.lower():
-                to_clear.append((
-                    getattr(c, "domain", None),
-                    getattr(c, "path", None),
-                    getattr(c, "name", None),
-                ))
-    except Exception:
-        return
-
-    for domain, path, name in to_clear:
-        try:
-            jar.clear(domain, path, name)
-        except Exception:
-            pass
+    clear_cookie_name_from_http_client(client, cookie_name)
 
 def _store_verified_findings(
     *,
@@ -318,34 +253,10 @@ def _apply_manual_auth_to_client(
     manual_headers_raw = str(os.getenv("MANUAL_AUTH_HEADERS", "") or "").strip()
 
     def _preferred_cookie_path(url: str) -> str:
-        path = urlsplit(str(url or "")).path or "/"
-        segs = [s for s in path.split("/") if s]
-        if segs:
-            return "/" + segs[0]
-        return "/"
+        return preferred_cookie_path_for_url(url)
 
     def _clear_cookie_name_from_client(cookie_name: str) -> None:
-        jar = getattr(client.cookies, "jar", None)
-        if jar is None:
-            return
-
-        to_clear: List[tuple[Any, Any, Any]] = []
-        try:
-            for c in list(jar):
-                if str(getattr(c, "name", "") or "").lower() == cookie_name.lower():
-                    to_clear.append((
-                        getattr(c, "domain", None),
-                        getattr(c, "path", None),
-                        getattr(c, "name", None),
-                    ))
-        except Exception:
-            return
-
-        for domain, path, name in to_clear:
-            try:
-                jar.clear(domain, path, name)
-            except Exception:
-                pass
+        clear_cookie_name_from_http_client(client, cookie_name)
 
     preferred_path = _preferred_cookie_path(target)
     host = (urlparse(target).hostname or "").strip() or None
@@ -398,7 +309,7 @@ def _apply_manual_auth_to_client(
             if not header_name:
                 continue
 
-            # Cookie는 절대 header로 넣지 않고 jar만 사용한다.
+            # Never inject Cookie as a manual header; use the cookie jar only.
             if header_name.lower() == "cookie":
                 continue
 
@@ -491,7 +402,7 @@ def _path_prefixes_from_url(url: str) -> List[str]:
         current += "/" + seg
         prefixes.append(current)
 
-    # 마지막 segment가 파일처럼 보여도, 디렉토리 path 자체도 고려
+    # Even if the last segment looks like a file, still consider the directory path itself.
     if not prefixes and segments:
         prefixes.append("/" + segments[0])
 
@@ -1562,18 +1473,6 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
 
     return out
 
-def finding_group(finding: Dict[str, Any]) -> str:
-    ftype = str(finding.get("type") or "")
-
-    if ftype in INFORMATION_DISCLOSURE_TYPES:
-        return "information_disclosure"
-
-    if ftype in SECURITY_MISCONFIGURATION_TYPES:
-        return "security_misconfiguration"
-
-    return "other"
-
-
 def _host_scope(url: str) -> str:
     if not url:
         return ""
@@ -1699,22 +1598,22 @@ def _drop_shadowed_false_positives(
         path = _route_path(_evidence_url(finding))
         base_path = _base_error_route(path)
 
-        # phpinfo 계열 weak error false positive 제거
+        # Remove weak phpinfo-style synthetic error false positives.
         if ftype == "HTTP_ERROR_INFO_EXPOSURE" and _is_phpinfo_route(finding):
             false_positive_map.pop(key, None)
             continue
 
-        # instructions/readme/help/about 같은 문서성 페이지의 synthetic error fp 제거
+        # Remove synthetic error false positives from documentation-style pages such as instructions, readme, help, or about.
         if ftype == "HTTP_ERROR_INFO_EXPOSURE" and _is_low_value_doc_route(finding):
             false_positive_map.pop(key, None)
             continue
 
-        # 같은 base route에 concrete finding이 있으면 파생 synthetic fp 제거
+        # If a concrete finding exists for the same base route, remove derived synthetic false positives.
         if (ftype, subtype, base_path) in confirmed_by_base and _is_synthetic_error_fp(finding):
             false_positive_map.pop(key, None)
             continue
 
-        # 기존 rule 유지
+        # Keep the existing rule as-is.
         if ftype in {"DEFAULT_FILE_EXPOSED", "PHPINFO_EXPOSURE", "HTTP_CONFIG_FILE_EXPOSURE"}:
             if any(_same_identity(finding, concrete) for concrete in concrete_findings):
                 false_positive_map.pop(key, None)
@@ -1757,13 +1656,13 @@ def _reconcile_bucket_precedence(
         for k, f in informational_map.items()
     }
 
-    # confirmed 와 semantic duplicate 인 informational 제거
+    # Remove informational findings that are semantic duplicates of confirmed findings.
     for key, finding in list(informational_map.items()):
         ident = _bucket_identity_for_dedup(finding)
         if ident in confirmed_identities:
             informational_map.pop(key, None)
 
-    # confirmed 또는 informational 과 semantic duplicate 인 false_positive 제거
+    # Remove false positives that are semantic duplicates of confirmed or informational findings.
     surviving_info_identities = {
         _bucket_identity_for_dedup(f): k
         for k, f in informational_map.items()
@@ -2583,51 +2482,6 @@ def update_coverage_from_candidate(candidate: Dict[str, Any], coverage: Dict[str
         coverage["cwe_319"]["candidate_count"] += 1
 
 
-def add_confirmed_counts_to_coverage(results: Dict[str, Any], coverage: Dict[str, Dict[str, Any]]) -> None:
-    for f in results.get("findings_confirmed", []):
-        cwe = f.get("cwe")
-        ctype = f.get("type")
-
-        if cwe == "CWE-209" or ctype == "HTTP_ERROR_INFO_EXPOSURE":
-            coverage["cwe_209"]["confirmed_count"] += 1
-        elif cwe == "CWE-497" or ctype == "HTTP_SYSTEM_INFO_EXPOSURE":
-            coverage["cwe_497"]["confirmed_count"] += 1
-        elif cwe == "CWE-548" or ctype == "DIRECTORY_LISTING_ENABLED":
-            coverage["cwe_548"]["confirmed_count"] += 1
-        elif cwe == "CWE-552" or ctype == "DEFAULT_FILE_EXPOSED":
-            coverage["cwe_552"]["confirmed_count"] += 1
-        elif cwe == "CWE-942" or ctype == "CORS_MISCONFIG":
-            coverage["cwe_942"]["confirmed_count"] += 1
-        elif cwe == "CWE-1004" or ctype == "COOKIE_HTTPONLY_MISSING":
-            coverage["cwe_1004"]["confirmed_count"] += 1
-        elif cwe == "CWE-614" or ctype == "COOKIE_SECURE_MISSING":
-            coverage["cwe_614"]["confirmed_count"] += 1
-        elif cwe == "CWE-319" or ctype in {"HTTPS_REDIRECT_MISSING", "HSTS_MISSING"}:
-            coverage["cwe_319"]["confirmed_count"] += 1
-
-def finalize_coverage_assessment(coverage: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    for key, item in coverage.items():
-        attempted = item.get("attempted", False)
-        candidate_count = item.get("candidate_count", 0)
-        confirmed_count = item.get("confirmed_count", 0)
-
-        if not attempted:
-            item["assessment"] = "not_attempted"
-            continue
-
-        if key in {"cwe_1004", "cwe_614"} and item.get("set_cookie_observed") is False:
-            item["assessment"] = "not_yet_sufficiently_validated"
-            continue
-
-        if confirmed_count > 0:
-            item["assessment"] = "confirmed"
-        elif candidate_count > 0:
-            item["assessment"] = "observed_but_not_confirmed"
-        else:
-            item["assessment"] = "not_observed_in_current_scope"
-
-    return coverage
-
 def _decode_response_preview(resp: httpx.Response, limit: int = 65535) -> tuple[str, bool, str | None, str | None]:
     try:
         body = resp.content[:limit]
@@ -2722,52 +2576,13 @@ async def _send_replay_request(
     response = None
 
     def _preferred_cookie_path(url: str) -> str:
-        path = urlsplit(str(url or "")).path or "/"
-        segs = [s for s in path.split("/") if s]
-        if segs:
-            return "/" + segs[0]
-        return "/"
+        return preferred_cookie_path_for_url(url)
 
     def _parse_manual_auth_cookie_pairs() -> Dict[str, str]:
-        raw = str(os.getenv("MANUAL_AUTH_COOKIE", "") or "").strip()
-        out: Dict[str, str] = {}
-
-        if not raw:
-            return out
-
-        for part in raw.split(";"):
-            piece = str(part or "").strip()
-            if not piece or "=" not in piece:
-                continue
-            k, v = piece.split("=", 1)
-            name = k.strip()
-            value = v.strip()
-            if name:
-                out[name] = value
-        return out
+        return parse_manual_auth_cookie_pairs()
 
     def _clear_cookie_name_from_client(cookie_name: str) -> None:
-        jar = getattr(client.cookies, "jar", None)
-        if jar is None:
-            return
-
-        to_clear: List[tuple[Any, Any, Any]] = []
-        try:
-            for c in list(jar):
-                if str(getattr(c, "name", "") or "").lower() == cookie_name.lower():
-                    to_clear.append((
-                        getattr(c, "domain", None),
-                        getattr(c, "path", None),
-                        getattr(c, "name", None),
-                    ))
-        except Exception:
-            return
-
-        for domain, path, name in to_clear:
-            try:
-                jar.clear(domain, path, name)
-            except Exception:
-                pass
+        clear_cookie_name_from_http_client(client, cookie_name)
 
     def _sanitize_headers_and_reseed_session(url: str, headers: Dict[str, Any]) -> Dict[str, str]:
         safe_headers: Dict[str, str] = {}
@@ -2779,34 +2594,7 @@ async def _send_replay_request(
                 continue
             safe_headers[ks] = "" if v is None else str(v)
 
-        manual_pairs = _parse_manual_auth_cookie_pairs()
-        preferred_path = _preferred_cookie_path(url)
-        host = (urlsplit(url).hostname or "").strip() or None
-
-        for cookie_name, cookie_value in manual_pairs.items():
-            if cookie_name.lower() != "jsessionid":
-                continue
-
-            _clear_cookie_name_from_client(cookie_name)
-
-            try:
-                if host:
-                    client.cookies.set(
-                        cookie_name,
-                        cookie_value,
-                        domain=host,
-                        path=preferred_path,
-                    )
-                else:
-                    client.cookies.set(
-                        cookie_name,
-                        cookie_value,
-                        path=preferred_path,
-                    )
-            except Exception:
-                pass
-
-        return safe_headers
+        return sanitize_request_headers_and_cookie_jar(client, url, safe_headers)
 
     for _attempt in range(max(1, retries + 1)):
         try:
@@ -3173,46 +2961,6 @@ def _log_object_replay_plan(
             f"mutation={spec.mutation_class} "
             f"group={spec.comparison_group}"
         )
-
-def compute_summary(results: Dict[str, Any]) -> Dict[str, Any]:
-    confirmed = results.get("findings_confirmed", [])
-    informational = results.get("findings_informational", [])
-    false_positive = results.get("findings_false_positive", [])
-
-    def by_cwe(items: List[Dict[str, Any]]) -> Dict[str, int]:
-        counts: Dict[str, int] = {}
-        for f in items:
-            key = f.get("cwe") or f.get("cwe_mapping_status") or "UNMAPPED"
-            counts[key] = counts.get(key, 0) + 1
-        return counts
-
-    def by_group(items: List[Dict[str, Any]]) -> Dict[str, int]:
-        counts: Dict[str, int] = {}
-        for f in items:
-            g = finding_group(f)
-            counts[g] = counts.get(g, 0) + 1
-        return counts
-
-    summary = {
-        "confirmed_count": len(confirmed),
-        "informational_count": len(informational),
-        "false_positive_count": len(false_positive),
-        "total_findings": len(confirmed) + len(informational) + len(false_positive),
-        "confirmed_by_cwe": by_cwe(confirmed),
-        "informational_by_cwe": by_cwe(informational),
-        "false_positive_by_cwe": by_cwe(false_positive),
-        "confirmed_by_group": by_group(confirmed),
-        "informational_by_group": by_group(informational),
-        "false_positive_by_group": by_group(false_positive),
-    }
-
-    if any((f.get("cwe_mapping_status") == OWASP_ONLY_NO_CWE_MAPPING) for f in confirmed + informational + false_positive):
-        summary["cwe_mapping_note"] = {
-            OWASP_ONLY_NO_CWE_MAPPING: "OWASP category is assigned, but no precise single CWE mapping is used for this finding."
-        }
-
-    return summary
-
 
 def resolve_scan_profile() -> str:
     return (os.getenv("SCAN_PROFILE") or "balanced").strip().lower()
