@@ -532,7 +532,6 @@ def looks_like_login_page(final_url: str, body_text: str) -> bool:
 
     return False
 
-
 def parse_login_forms(base_url: str, body_text: str) -> List[Dict[str, Any]]:
     from html import unescape
 
@@ -1617,6 +1616,7 @@ async def verify_session_fixation(
             continue
 
     return findings
+
 
 def _replay_safe_json_loads(text: str) -> Any:
     try:
