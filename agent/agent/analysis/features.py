@@ -149,6 +149,11 @@ CONFIG_KEY_PATTERNS = [
     r"db[_\-]?name",
     r"db[_\-]?user",
     r"db[_\-]?pass(word)?",
+    r"database[_\-\s]server",
+    r"database[_\-\s]host",
+    r"database[_\-\s]name",
+    r"database[_\-\s]user(name)?",
+    r"database[_\-\s]pass(word)?",
     r"database[_\-]?(url|uri|name|host|user|password)",
     r"redis[_\-]?(host|password)",
     r"api[_\-]?key",
@@ -174,6 +179,15 @@ KV_REGEXES = [
     re.compile(r"(?i)\b([a-zA-Z0-9_\-\.]{3,})\s*:\s*([^\n#]+)"),  # yaml
     re.compile(r"(?i)define\s*\(\s*[\"']([A-Z0-9_\-]+)[\"']\s*,\s*[\"']([^\"']+)[\"']\s*\)"),  # php define
     re.compile(r"(?i)\$([a-zA-Z0-9_\-]+)\s*=\s*[\"']([^\"']+)[\"']"),  # php var
+]
+
+HTML_LABEL_VALUE_REGEXES = [
+    re.compile(
+        r"(?is)<tr[^>]*>\s*(?:<t[dh][^>]*>\s*){1,2}([^<]{2,80}?)\s*</t[dh]>\s*<t[dh][^>]*>\s*([^<]{1,200}?)\s*</t[dh]>\s*</tr>"
+    ),
+    re.compile(
+        r"(?is)<(?:li|p|div|span|td|th)[^>]*>\s*(database(?:\s+server|\s+host|\s+name|\s+username|\s+user|\s+password)?|db[_\-\s]?(?:host|name|user|username|password|pass|port))\s*[:=]\s*([^<\n]{1,200})"
+    ),
 ]
 
 
@@ -206,28 +220,73 @@ def _extract_config_values(body: str) -> List[Dict[str, Any]]:
 
     findings: List[Dict[str, Any]] = []
 
+    def _normalize_label_key(raw_key: str) -> str:
+        key_l = str(raw_key or "").strip().lower()
+        key_l = re.sub(r"<[^>]+>", " ", key_l)
+        key_l = re.sub(r"&nbsp;|&#160;", " ", key_l)
+        key_l = re.sub(r"[\s_\-]+", " ", key_l).strip()
+
+        mapping = [
+            (r"\bdatabase server\b", "db_host"),
+            (r"\bdatabase host\b", "db_host"),
+            (r"\bdb host\b", "db_host"),
+            (r"\bdatabase name\b", "db_name"),
+            (r"\bdb name\b", "db_name"),
+            (r"\bdatabase username\b", "db_user"),
+            (r"\bdatabase user\b", "db_user"),
+            (r"\bdb username\b", "db_user"),
+            (r"\bdb user\b", "db_user"),
+            (r"\bdatabase password\b", "db_password"),
+            (r"\bdb password\b", "db_password"),
+            (r"\bdb pass\b", "db_password"),
+            (r"\bdatabase port\b", "db_port"),
+            (r"\bdb port\b", "db_port"),
+        ]
+        for pattern, normalized in mapping:
+            if re.search(pattern, key_l):
+                return normalized
+        return key_l.replace(" ", "_")
+
+    def _clean_value(raw_value: str) -> str:
+        value = str(raw_value or "").strip()
+        value = re.sub(r"<[^>]+>", " ", value)
+        value = value.replace("&nbsp;", " ").replace("&#160;", " ")
+        value = re.sub(r"\s+", " ", value).strip(" :\t\r\n")
+        return value
+
+    def _append_candidate(key: str, value: str) -> None:
+        key_norm = _normalize_label_key(key)
+        value_norm = _clean_value(value)
+        if not key_norm or not value_norm:
+            return
+        if len(value_norm) > 200:
+            value_norm = value_norm[:200]
+        if not any(re.search(p, key_norm) for p in CONFIG_KEY_PATTERNS):
+            return
+
+        masked = _is_masked_value(value_norm)
+        interesting = _is_interesting_secret(value_norm)
+        findings.append(
+            {
+                "key": key_norm,
+                "value": value_norm,
+                "masked": masked,
+                "interesting": interesting,
+            }
+        )
+
     for regex in KV_REGEXES:
         for match in regex.findall(body):
             if len(match) != 2:
                 continue
 
-            key = match[0].strip()
-            value = match[1].strip()
+            _append_candidate(match[0], match[1])
 
-            key_l = key.lower()
-
-            if not any(re.search(p, key_l) for p in CONFIG_KEY_PATTERNS):
+    for regex in HTML_LABEL_VALUE_REGEXES:
+        for match in regex.findall(body):
+            if len(match) != 2:
                 continue
-
-            masked = _is_masked_value(value)
-            interesting = _is_interesting_secret(value)
-
-            findings.append({
-                "key": key,
-                "value": value[:200],
-                "masked": masked,
-                "interesting": interesting,
-            })
+            _append_candidate(match[0], match[1])
 
     # dedup
     seen = set()
