@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 
-from agent.scan_runtime import (
+from agent.runtime.scan_runtime import (
     build_auth_args,
     prepare_output_path,
     resolve_target_name,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from agent.verification_policy import build_signal_metadata
+from agent.analysis.verification_policy import build_signal_metadata
 
 
 OWASP_ONLY_NO_CWE_REASON = (

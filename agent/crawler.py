@@ -66,6 +66,16 @@ STATIC_EXTS = (
 )
 
 JS_EXTS = (".js",)
+TEXT_LIKE_TYPES = (
+    "text/",
+    "application/json",
+    "application/javascript",
+    "application/x-javascript",
+    "application/xml",
+    "text/xml",
+    "application/xhtml+xml",
+    "application/graphql",
+)
 
 
 def _normalize_url(url: str) -> str:
@@ -208,6 +218,14 @@ def _looks_like_endpoint_candidate(raw: str) -> bool:
 
     return False
 
+
+def _is_probably_text_like_response(content_type: str | None, text: str) -> bool:
+    ct = (content_type or "").lower()
+    if any(token in ct for token in TEXT_LIKE_TYPES):
+        return True
+    snippet = (text or "")[:400].strip()
+    return bool(snippet) and any(ch in snippet for ch in ("{", "}", "<", "/", ":", "[", "]"))
+
 def _spa_seed_urls(seed_url: str, *, crawl_state: str = "anonymous") -> List[str]:
     base = _normalize_url(seed_url)
     parts = urlsplit(base)
@@ -329,17 +347,37 @@ class LinkExtractor(HTMLParser):
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, str | None]]) -> None:
         attr_map = dict(attrs)
         tag = tag.lower()
-    
-        if "href" in attr_map and attr_map["href"]:
-            self.links.add(_normalize_url(urljoin(self.base_url, attr_map["href"])))
-    
-        if "src" in attr_map and attr_map["src"]:
-            abs_url = _normalize_url(urljoin(self.base_url, attr_map["src"]))
-            if tag == "script":
+
+        candidate_attr_names = {
+            "href",
+            "src",
+            "action",
+            "formaction",
+            "data-href",
+            "data-url",
+            "data-endpoint",
+            "data-api",
+            "data-action",
+            "routerlink",
+            "to",
+            "hx-get",
+            "hx-post",
+            "hx-put",
+            "hx-delete",
+            "hx-patch",
+            "xlink:href",
+        }
+        for attr_name, attr_value in attr_map.items():
+            if not attr_value:
+                continue
+            if attr_name.lower() not in candidate_attr_names:
+                continue
+            abs_url = _normalize_url(urljoin(self.base_url, attr_value))
+            if attr_name.lower() == "src" and tag == "script":
                 self.scripts.add(abs_url)
             else:
                 self.links.add(abs_url)
-    
+
         if tag == "form":
             action = attr_map.get("action") or self.base_url
             method = (attr_map.get("method") or "GET").upper()
@@ -364,11 +402,22 @@ class LinkExtractor(HTMLParser):
                         self._current_form["field_defaults"][name] = value
                     elif input_type in {"checkbox", "radio"} and attr_map.get("checked") is not None:
                         self._current_form["field_defaults"][name] = value or "on"
-    
+
+        if tag == "button" and self._current_form is not None:
+            button_action = attr_map.get("formaction")
+            if button_action:
+                self.links.add(_normalize_url(urljoin(self.base_url, button_action)))
+            name = attr_map.get("name")
+            if name:
+                self._current_form["field_names"].append(name)
+
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "form" and self._current_form is not None:
             self.forms.append(self._current_form)
             self._current_form = None
+
+    def handle_startendtag(self, tag: str, attrs: List[Tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
 
 
 def _regex_extract_urls_from_html(base_url: str, text: str) -> Set[str]:
@@ -394,6 +443,62 @@ def _regex_extract_urls_from_html(base_url: str, text: str) -> Set[str]:
             abs_url = _normalize_url(urljoin(base_url, raw))
             out.add(abs_url)
 
+    return out
+
+
+def _extract_header_endpoints(base_url: str, headers: Dict[str, str]) -> Set[str]:
+    out: Set[str] = set()
+    for key, value in (headers or {}).items():
+        header_name = str(key or "").strip().lower()
+        header_value = str(value or "").strip()
+        if not header_value:
+            continue
+
+        if header_name in {"location", "content-location", "x-rewrite-url", "x-accel-redirect"}:
+            if _looks_like_endpoint_candidate(header_value):
+                out.add(_normalize_url(urljoin(base_url, header_value)))
+            continue
+
+        if header_name == "link":
+            for match in re.finditer(r"<([^>]+)>", header_value):
+                raw = str(match.group(1) or "").strip()
+                if raw and _looks_like_endpoint_candidate(raw):
+                    out.add(_normalize_url(urljoin(base_url, raw)))
+            continue
+
+        if header_name == "refresh":
+            refresh_match = re.search(r"url=([^;]+)$", header_value, re.I)
+            if refresh_match:
+                raw = str(refresh_match.group(1) or "").strip()
+                if raw and _looks_like_endpoint_candidate(raw):
+                    out.add(_normalize_url(urljoin(base_url, raw)))
+
+    return out
+
+
+def _extract_robots_or_sitemap_endpoints(base_url: str, text: str) -> Set[str]:
+    out: Set[str] = set()
+    body = text or ""
+
+    for match in re.finditer(r"(?im)^\s*(?:allow|disallow|sitemap)\s*:\s*(\S+)\s*$", body):
+        raw = str(match.group(1) or "").strip()
+        if not raw or raw == "/":
+            continue
+        if _looks_like_endpoint_candidate(raw) or raw.startswith(("http://", "https://", "/")):
+            out.add(_normalize_url(urljoin(base_url, raw)))
+
+    for match in re.finditer(r"(?is)<loc>\s*([^<]+?)\s*</loc>", body):
+        raw = str(match.group(1) or "").strip()
+        if raw and _looks_like_endpoint_candidate(raw):
+            out.add(_normalize_url(urljoin(base_url, raw)))
+
+    return out
+
+
+def _extract_textual_endpoints(base_url: str, text: str) -> Set[str]:
+    out = extract_js_style_endpoints(base_url, text)
+    out |= _regex_extract_urls_from_html(base_url, text)
+    out |= _extract_robots_or_sitemap_endpoints(base_url, text)
     return out
 
 
@@ -701,6 +806,7 @@ async def discover_endpoints(
             continue
 
         resolved_url = _normalize_url(final_url or current)
+        header_links = _extract_header_endpoints(resolved_url, headers)
 
         if _is_allowed_candidate(resolved_url):
             resolved_ep = _make_endpoint(
@@ -718,16 +824,64 @@ async def discover_endpoints(
                 and resolved_url not in visited
                 and not _looks_like_static_asset(resolved_url)
                 and not (authenticated_mode and resolved_ep.get("is_session_destructive"))
-            ):
-                _enqueue_candidate(resolved_url, depth + 1, current)
+                ):
+                    _enqueue_candidate(resolved_url, depth + 1, current)
 
         content_type = headers.get("content-type", "")
         is_html = _is_probably_html_response(content_type, text)
         is_js = _is_probably_javascript_response(resolved_url, content_type, text)
+        is_text_like = _is_probably_text_like_response(content_type, text)
+
+        for link in header_links:
+            link = _normalize_url(link)
+            if not _is_allowed_candidate(link):
+                continue
+
+            ep = _make_endpoint(
+                link,
+                kind=classify_url_kind(link),
+                source=resolved_url,
+                depth=depth + 1,
+                is_redirect_target=True,
+                state=crawl_state,
+            )
+            _register_endpoint(ep)
+
+            if (
+                depth + 1 <= max_depth
+                and link not in visited
+                and not _looks_like_static_asset(link)
+                and not (authenticated_mode and ep.get("is_session_destructive"))
+            ):
+                _enqueue_candidate(link, depth + 1, resolved_url)
 
         if include_js_string_paths and is_js:
             js_links = extract_js_style_endpoints(resolved_url, text)
             for link in js_links:
+                link = _normalize_url(link)
+                if not _is_allowed_candidate(link):
+                    continue
+
+                ep = _make_endpoint(
+                    link,
+                    kind=classify_url_kind(link),
+                    source=resolved_url,
+                    depth=depth + 1,
+                    state=crawl_state,
+                )
+                _register_endpoint(ep)
+
+                if (
+                    depth + 1 <= max_depth
+                    and link not in visited
+                    and not _looks_like_static_asset(link)
+                    and not (authenticated_mode and ep.get("is_session_destructive"))
+                ):
+                    _enqueue_candidate(link, depth + 1, resolved_url)
+
+        if is_text_like and not is_html and not is_js:
+            textual_links = _extract_textual_endpoints(resolved_url, text)
+            for link in textual_links:
                 link = _normalize_url(link)
                 if not _is_allowed_candidate(link):
                     continue

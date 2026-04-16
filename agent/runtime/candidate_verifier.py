@@ -13,9 +13,9 @@ from agent.runtime.candidate_finalizer import (
     _should_downgrade_weak_resource_signal,
 )
 from agent.candidates import generate_candidates
-from agent.features import extract_features
+from agent.analysis.features import extract_features
 from agent.method_capability import verify_risky_http_methods_capability
-from agent.verification_policy import should_mark_manual_review, should_skip_reproduce
+from agent.analysis.verification_policy import should_mark_manual_review, should_skip_reproduce
 
 
 async def _verify_cors_misconfig_active(

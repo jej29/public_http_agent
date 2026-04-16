@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List
 
-from agent.finding_types import (
+from agent.findings.types import (
     INFORMATION_DISCLOSURE_TYPES,
     SECURITY_MISCONFIGURATION_TYPES,
 )

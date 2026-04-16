@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
-from agent.http_classifier import collect_http_signals
+from agent.http.classifier import collect_http_signals
 
 OWASP_ONLY_NO_CWE_MAPPING = "OWASP_ONLY_NO_CWE_MAPPING"
 OWASP_ONLY_NO_CWE_REASON = (

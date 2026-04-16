@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from agent.finding_types import (
+from agent.findings.types import (
     INFORMATION_DISCLOSURE_TYPES,
     OWASP_ONLY_NO_CWE_MAPPING,
     SECURITY_MISCONFIGURATION_TYPES,
