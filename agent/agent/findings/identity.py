@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 from urllib.parse import urlsplit
 
 from agent.core.scope import (
+    canonical_finding_url,
     disclosure_scope_url,
     host_scope_url,
     misconfig_scope_url,
@@ -331,6 +332,14 @@ def stable_finding_filename(finding: Dict[str, Any]) -> str:
     if ftype == "HTTP_ERROR_INFO_EXPOSURE":
         bucket = _bucket_route_for_error(final_url)
         path = urlsplit(bucket).path if bucket else urlsplit(final_url).path
+    elif ftype in {
+        "PHPINFO_EXPOSURE",
+        "HTTP_CONFIG_FILE_EXPOSURE",
+        "LOG_VIEWER_EXPOSURE",
+        "FILE_PATH_HANDLING_ANOMALY",
+        "HTTP_SYSTEM_INFO_EXPOSURE",
+    }:
+        path = urlsplit(canonical_finding_url(finding)).path
     elif ftype == "RISKY_HTTP_METHODS_ENABLED":
         path = "root"
     else:

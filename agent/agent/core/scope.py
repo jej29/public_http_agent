@@ -1,7 +1,32 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict
 from urllib.parse import urlparse, urlunparse
+
+
+_SYNTHETIC_PATH_SEGMENT_RE = re.compile(r"^__nonexistent_[a-z0-9]+$", re.IGNORECASE)
+
+
+def _normalize_probe_artifact_path(path: str) -> str:
+    normalized = path or "/"
+
+    while "//" in normalized:
+        normalized = normalized.replace("//", "/")
+
+    parts = normalized.split("/")
+    while parts and _SYNTHETIC_PATH_SEGMENT_RE.match(parts[-1] or ""):
+        parts.pop()
+
+    normalized = "/".join(parts) or "/"
+
+    while "//" in normalized:
+        normalized = normalized.replace("//", "/")
+
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+
+    return normalized or "/"
 
 
 def normalize_url_for_dedup(url: str) -> str:
@@ -12,11 +37,7 @@ def normalize_url_for_dedup(url: str) -> str:
 
     scheme = parsed.scheme.lower()
     netloc = parsed.netloc.lower()
-    path = parsed.path or "/"
-
-    # remove duplicate slashes
-    while "//" in path:
-        path = path.replace("//", "/")
+    path = _normalize_probe_artifact_path(parsed.path or "/")
 
     # remove trailing slash (except root)
     if path != "/" and path.endswith("/"):
@@ -32,7 +53,9 @@ def host_scope_url(url: str) -> str:
 
 def route_scope_url(url: str) -> str:
     parsed = urlparse(url)
-    path = parsed.path or "/"
+    path = _normalize_probe_artifact_path(parsed.path or "/")
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
     return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
 
 
@@ -99,4 +122,3 @@ def canonical_finding_url(finding: Dict[str, Any]) -> str:
         or finding.get("url")
         or ""
     )
-
