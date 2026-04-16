@@ -44,6 +44,13 @@ def _has_concrete_body_exposure(candidate: Dict[str, Any]) -> bool:
             for item in (evidence.get("config_exposure_markers") or [])
             if str(item).strip()
         ]
+        real_values = evidence.get("config_real_values") or []
+        key_classes = {
+            str(item.get("key_class") or "").strip().lower()
+            for item in real_values
+            if isinstance(item, dict) and str(item.get("key_class") or "").strip()
+        }
+        php_config_assignment_count = int(evidence.get("php_config_assignment_count") or 0)
         body_hint = str(evidence.get("body_content_type_hint") or "").lower()
         final_url = str(evidence.get("final_url") or "").lower()
 
@@ -80,7 +87,14 @@ def _has_concrete_body_exposure(candidate: Dict[str, Any]) -> bool:
             )
         )
         config_like_body = body_hint in {"json", "json_like", "yaml", "yaml_like", "xml", "xml_like"}
+        db_context_classes = {"db_host", "db_name", "db_user", "db_password", "db_port"}
 
+        if php_config_assignment_count >= 3:
+            return True
+        if len(real_values) >= 3:
+            return True
+        if len(key_classes.intersection(db_context_classes)) >= 3:
+            return True
         if len(set(markers).intersection(strong_tokens)) >= 1 and (config_like_path or config_like_body):
             return True
         if len(markers) >= 3 and config_like_body:

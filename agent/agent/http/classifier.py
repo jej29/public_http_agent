@@ -245,6 +245,53 @@ def _is_same_error_page_for_resource_probe(snapshot: Dict[str, Any], feats: Dict
     return False
 
 
+def _has_strong_config_payload(feats: Dict[str, Any], snapshot: Dict[str, Any]) -> bool:
+    extracted_values = feats.get("config_extracted_values") or []
+    real_values = [
+        item
+        for item in extracted_values
+        if isinstance(item, dict) and not bool(item.get("masked"))
+    ]
+    if len(real_values) >= 3:
+        return True
+
+    key_classes = set()
+    for item in extracted_values:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip().lower()
+        if not key:
+            continue
+        if "password" in key:
+            key_classes.add("db_password")
+        if key in {"db_server", "database_server", "db_host", "database_host", "host"}:
+            key_classes.add("db_host")
+        if key in {"db_database", "database", "db_name", "database_name", "dbname"}:
+            key_classes.add("db_name")
+        if key in {"db_user", "database_user", "database_username", "username", "user"}:
+            key_classes.add("db_user")
+        if "secret" in key or "token" in key or "api_key" in key or "access_key" in key:
+            key_classes.add("secret")
+
+    if len(key_classes.intersection({"db_host", "db_name", "db_user", "db_password"})) >= 3:
+        return True
+    if "secret" in key_classes or "db_password" in key_classes:
+        return True
+
+    body_l = _body_text(snapshot, feats).lower()
+    php_config_tokens = (
+        "$_dvwa['db_server']",
+        "$_dvwa['db_database']",
+        "$_dvwa['db_user']",
+        "$_dvwa['db_password']",
+        "db_server",
+        "db_database",
+        "db_user",
+        "db_password",
+    )
+    return sum(1 for token in php_config_tokens if token in body_l) >= 3
+
+
 def _build_policy_signals(
     request_meta: Dict[str, Any],
     snapshot: Dict[str, Any],
@@ -391,6 +438,9 @@ def _should_skip_resource_exposure(
     body_text = _body_text(snapshot, feats)
     status_code = _status_code(snapshot, feats)
 
+    if status_code == 200 and _has_strong_config_payload(feats, snapshot):
+        return False
+
     if should_skip_info_disclosure(request_meta, snapshot, feats):
         return True
 
@@ -407,4 +457,3 @@ def _should_skip_resource_exposure(
         return True
 
     return False
-

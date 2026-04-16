@@ -752,6 +752,20 @@ def _build_config_exposure_signal(
     body_text = _body_text(snapshot, feats)
     body_text_l = body_text.lower()
     path_l = final_url.lower()
+    php_config_assignment_count = sum(
+        1
+        for token in (
+            "$_dvwa['db_server']",
+            "$_dvwa['db_database']",
+            "$_dvwa['db_user']",
+            "$_dvwa['db_password']",
+            '$_dvwa["db_server"]',
+            '$_dvwa["db_database"]',
+            '$_dvwa["db_user"]',
+            '$_dvwa["db_password"]',
+        )
+        if token in body_text_l
+    )
 
     if status_code != 200:
         return []
@@ -847,6 +861,7 @@ def _build_config_exposure_signal(
         has_real_secret
         or html_db_setup_exposure
         or len(real_values) >= 3
+        or php_config_assignment_count >= 3
         or (has_real_db_context and len(real_values) >= 2)
         or (
             path_is_config_like
@@ -861,7 +876,7 @@ def _build_config_exposure_signal(
         return []
 
     exposed_information = _format_config_exposed_information(extracted_summary, markers)
-    severity = "High" if has_real_secret or len(real_values) >= 3 or html_db_setup_exposure else "Medium"
+    severity = "High" if has_real_secret or len(real_values) >= 3 or html_db_setup_exposure or php_config_assignment_count >= 3 else "Medium"
     confidence = 0.94 if severity == "High" else 0.86
 
     representative_leak = final_url
@@ -892,6 +907,7 @@ def _build_config_exposure_signal(
                 "config_key_classes": sorted(real_key_classes),
                 "distinct_db_context_count": distinct_db_context_count,
                 "html_db_setup_exposure": html_db_setup_exposure,
+                "php_config_assignment_count": php_config_assignment_count,
                 "body_content_type_hint": feats.get("body_content_type_hint"),
                 "path_is_config_like": path_is_config_like,
                 "config_like_body_kind": config_like_body_kind,
