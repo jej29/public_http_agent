@@ -145,7 +145,9 @@ CONFIG_EXPOSURE_MARKERS = [
 # =========================
 
 CONFIG_KEY_PATTERNS = [
+    r"db[_\-]?server",
     r"db[_\-]?host",
+    r"db[_\-]?database",
     r"db[_\-]?name",
     r"db[_\-]?user",
     r"db[_\-]?pass(word)?",
@@ -179,6 +181,7 @@ KV_REGEXES = [
     re.compile(r"(?i)\b([a-zA-Z0-9_\-\.]{3,})\s*:\s*([^\n#]+)"),  # yaml
     re.compile(r"(?i)define\s*\(\s*[\"']([A-Z0-9_\-]+)[\"']\s*,\s*[\"']([^\"']+)[\"']\s*\)"),  # php define
     re.compile(r"(?i)\$([a-zA-Z0-9_\-]+)\s*=\s*[\"']([^\"']+)[\"']"),  # php var
+    re.compile(r"(?is)\[\s*[\"']([a-zA-Z0-9_\-\.]{3,})[\"']\s*\]\s*=\s*[\"']([^\"'\r\n]{1,200})[\"']"),  # php array key assignment
 ]
 
 HTML_LABEL_VALUE_REGEXES = [
