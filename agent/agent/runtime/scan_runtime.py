@@ -385,6 +385,81 @@ async def _process_auth_snapshots(
     return seq
 
 
+async def _run_authenticated_business_probes(
+    *,
+    client: httpx.AsyncClient,
+    target: str,
+    allowed_app_prefixes: List[str],
+    authenticated: bool,
+    authenticated_endpoints: List[Dict[str, Any]],
+    anonymous_endpoints: List[Dict[str, Any]],
+    timeout_s: float,
+    retries: int,
+    run_dir: Path,
+    raw_index: List[Dict[str, Any]],
+    coverage: Dict[str, Dict[str, Any]],
+    confirmed_map: Dict[str, Dict[str, Any]],
+    informational_map: Dict[str, Dict[str, Any]],
+    false_positive_map: Dict[str, Dict[str, Any]],
+    request_failures: List[Dict[str, Any]],
+    seq_start: int,
+    shared_unhealthy_scopes: set[str] | None = None,
+) -> int:
+    if not authenticated:
+        return seq_start
+
+    auth_business_plan = build_authenticated_business_probe_plan(
+        authenticated_endpoints=authenticated_endpoints or [],
+        anonymous_endpoints=anonymous_endpoints or [],
+    )
+    if not auth_business_plan:
+        log("AUTH", "Authenticated business probes skipped: no candidate endpoints")
+        return seq_start
+
+    auth_business_plan = filter_request_specs_by_app_scope(
+        auth_business_plan,
+        base_target=target,
+        allowed_prefixes=allowed_app_prefixes,
+    )
+    if not auth_business_plan:
+        log("AUTH", "Authenticated business probes skipped: no app-scoped targets")
+        return seq_start
+
+    destructive_urls = {
+        str(ep.get("url") or "").strip()
+        for ep in (authenticated_endpoints or [])
+        if is_session_destructive_endpoint(ep)
+    }
+    if destructive_urls:
+        auth_business_plan = [
+            spec
+            for spec in auth_business_plan
+            if str(getattr(spec, "url", "") or "").strip() not in destructive_urls
+        ]
+
+    if not auth_business_plan:
+        log("AUTH", "Authenticated business probes skipped: only session-destructive targets remained")
+        return seq_start
+
+    log("AUTH", f"Running authenticated business probes against {len(auth_business_plan)} targets")
+    return await _run_plan_and_merge(
+        client=client,
+        plan=auth_business_plan,
+        timeout_s=timeout_s,
+        retries=retries,
+        run_dir=run_dir,
+        raw_index=raw_index,
+        coverage=coverage,
+        seq_start=seq_start,
+        authenticated=True,
+        confirmed_map=confirmed_map,
+        informational_map=informational_map,
+        false_positive_map=false_positive_map,
+        request_failures=request_failures,
+        shared_unhealthy_scopes=shared_unhealthy_scopes,
+    )
+
+
 def _build_static_plan_from_endpoints(
     *,
     target: str,
@@ -2771,4 +2846,3 @@ async def run_scan(
         )
 
     return 0
-
