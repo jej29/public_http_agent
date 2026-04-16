@@ -114,7 +114,21 @@ def has_strong_error_disclosure(candidate: Dict[str, Any]) -> bool:
         and str(x).strip().lower() not in {"sqlite3.", "sqlite3", "mysql", "postgres", "oracle"}
         and not any(tok in str(x).lower() for tok in ("<span", "</span>", "color:", "&lt;span"))
     ]
-    if stack_traces or db_errors or evidence.get("file_paths"):
+    runtime_error_messages = [
+        str(x).strip()
+        for x in (evidence.get("runtime_error_messages") or [])
+        if str(x).strip()
+        and len(str(x).strip()) >= 24
+        and not any(tok in str(x).lower() for tok in ("<span", "</span>", "color:", "&lt;span"))
+    ]
+    if stack_traces or db_errors:
+        return True
+    if runtime_error_messages and evidence.get("file_paths"):
+        return True
+    if evidence.get("file_paths") and any(
+        tok in " | ".join(runtime_error_messages).lower()
+        for tok in ("failed to open stream", "headers already sent", "undefined array key")
+    ):
         return True
     return evidence.get("error_exposure_class") == "debug_error_page" and len(evidence.get("debug_hints") or []) >= 2
 

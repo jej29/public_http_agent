@@ -159,6 +159,11 @@ def _is_concrete_error_disclosure(candidate: Dict[str, Any]) -> bool:
     stack_traces = _meaningful_stack_trace_values(evidence.get("stack_traces") or [])
     file_paths = evidence.get("file_paths") or []
     db_errors = _meaningful_db_error_values(evidence.get("db_errors") or [])
+    runtime_error_messages = [
+        " ".join(str(x or "").replace("\ufffd", "").split()).strip()
+        for x in (evidence.get("runtime_error_messages") or [])
+        if " ".join(str(x or "").replace("\ufffd", "").split()).strip()
+    ]
     debug_hints = evidence.get("debug_hints") or []
     default_error_hint = evidence.get("default_error_hint")
 
@@ -166,6 +171,22 @@ def _is_concrete_error_disclosure(candidate: Dict[str, Any]) -> bool:
         return True
 
     if stack_traces:
+        return True
+
+    if runtime_error_messages and file_paths and any(
+        tok in " | ".join(runtime_error_messages).lower()
+        for tok in (
+            "uncaught",
+            "exception",
+            "sql",
+            "mysqli",
+            "pdo",
+            "query",
+            "failed to open stream",
+            "headers already sent",
+            "undefined array key",
+        )
+    ):
         return True
 
     if file_paths and _has_local_file_path(candidate):
@@ -381,11 +402,27 @@ def _is_phpinfo_route_error_false_positive(candidate: Dict[str, Any]) -> bool:
 
 def _cap_ambiguous_confirmed_severity(candidate: Dict[str, Any], current_sev: str) -> str:
     candidate_type = str(candidate.get("type") or "")
+    evidence = _evidence(candidate)
 
     if candidate_type in {"PHPINFO_EXPOSURE", "HTTP_CONFIG_FILE_EXPOSURE", "LOG_VIEWER_EXPOSURE"}:
         return _max_severity(current_sev, "Medium")
 
     if candidate_type in {"HTTP_ERROR_INFO_EXPOSURE", "FILE_PATH_HANDLING_ANOMALY"}:
+        if candidate_type == "HTTP_ERROR_INFO_EXPOSURE":
+            stack_traces = _meaningful_stack_trace_values(evidence.get("stack_traces") or [])
+            db_errors = _meaningful_db_error_values(evidence.get("db_errors") or [])
+            runtime_error_messages = [
+                " ".join(str(x or "").replace("\ufffd", "").split()).strip()
+                for x in (evidence.get("runtime_error_messages") or [])
+                if " ".join(str(x or "").replace("\ufffd", "").split()).strip()
+            ]
+            joined_runtime = " | ".join(runtime_error_messages).lower()
+            if stack_traces or db_errors or any(
+                tok in joined_runtime
+                for tok in ("uncaught", "exception", "sql", "mysqli", "pdo", "query")
+            ):
+                return "High"
+            return "Medium"
         return _max_severity(current_sev, "Medium")
 
     if candidate_type == "HTTP_SYSTEM_INFO_EXPOSURE":

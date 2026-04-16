@@ -102,6 +102,21 @@ def _meaningful_db_errors(items: List[str]) -> List[str]:
     return _dedup(out)
 
 
+def _meaningful_runtime_error_messages(items: List[str]) -> List[str]:
+    out: List[str] = []
+    for item in items or []:
+        text = _clean_disclosure_text(item)
+        if not text:
+            continue
+        if len(text) < 24:
+            continue
+        lowered = text.lower()
+        if any(token in lowered for token in ("<span", "</span>", "color:", "&lt;span")):
+            continue
+        out.append(text)
+    return _dedup(out)
+
+
 def _meaningful_file_paths(items: List[str]) -> List[str]:
     out: List[str] = []
     for item in items or []:
@@ -274,6 +289,7 @@ def _build_error_disclosure_signals(
     stack_traces = _meaningful_stack_traces(feats.get("stack_traces") or [])
     file_paths = _meaningful_file_paths(feats.get("file_paths") or [])
     db_errors = _meaningful_db_errors(feats.get("db_errors") or [])
+    runtime_error_messages = _meaningful_runtime_error_messages(feats.get("runtime_error_messages") or [])
     phpinfo_indicators = _dedup(feats.get("phpinfo_indicators") or [])
     phpinfo_extracted_values = feats.get("phpinfo_extracted_values") or []
     debug_hints = _dedup(feats.get("debug_hints") or [])
@@ -285,6 +301,7 @@ def _build_error_disclosure_signals(
         return []
 
     exposed_information: List[str] = []
+    exposed_information.extend([f"Error message: {item}" for item in runtime_error_messages[:2]])
     exposed_information.extend([f"Stack trace: {_clean_disclosure_text(item)}" for item in stack_traces[:2]])
     exposed_information.extend([f"File path: {item}" for item in file_paths[:3]])
     exposed_information.extend([f"Database error: {item}" for item in db_errors[:2]])
@@ -292,7 +309,7 @@ def _build_error_disclosure_signals(
     if default_error_hint:
         exposed_information.append(f"Default error template: {default_error_hint}")
     exposed_information = _dedup(exposed_information)
-    has_concrete_error_artifact = bool(stack_traces or file_paths or db_errors)
+    has_concrete_error_artifact = bool(stack_traces or file_paths or db_errors or runtime_error_messages)
     if not exposed_information and not error_class:
         return []
     if not has_concrete_error_artifact and error_class in {"stack_trace", "db_error"}:
@@ -300,8 +317,22 @@ def _build_error_disclosure_signals(
     if not has_concrete_error_artifact and default_error_hint and len(debug_hints) < 2:
         return []
 
-    severity = "High" if db_errors or stack_traces or file_paths else "Medium"
-    confidence = 0.94 if db_errors or stack_traces or file_paths else 0.87
+    high_value_runtime = any(
+        tok in msg.lower()
+        for msg in runtime_error_messages
+        for tok in (
+            "uncaught",
+            "exception",
+            "sql",
+            "mysqli",
+            "pdo",
+            "query",
+            "failed to open stream",
+            "headers already sent",
+        )
+    )
+    severity = "High" if db_errors or stack_traces or (high_value_runtime and file_paths) else "Medium"
+    confidence = 0.94 if db_errors or stack_traces or runtime_error_messages else 0.87
 
     return [
         _build_signal(
@@ -322,6 +353,7 @@ def _build_error_disclosure_signals(
                 "stack_traces": stack_traces,
                 "file_paths": file_paths,
                 "db_errors": db_errors,
+                "runtime_error_messages": runtime_error_messages,
                 "debug_hints": debug_hints,
                 "default_error_hint": default_error_hint,
                 "error_template_fingerprint": template_fingerprint,

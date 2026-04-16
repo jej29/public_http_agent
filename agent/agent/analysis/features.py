@@ -114,6 +114,10 @@ DEBUG_HINT_PATTERNS = [
     re.compile(r"\bdebug (?:mode|page|toolbar)\b", re.I),
     re.compile(r"\brunning in debug\b", re.I),
 ]
+RUNTIME_ERROR_PATTERNS = [
+    re.compile(r"(?is)<b>\s*(fatal error|warning|notice|deprecated)\s*</b>\s*:?\s*(.{1,500}?)(?=<br\s*/?>|</div>|</p>|</td>|</body>|$)"),
+    re.compile(r"(?im)^(fatal error|warning|notice|deprecated)\s*:\s*(.{1,500})$"),
+]
 DIRECTORY_LISTING_PATTERNS = [
     re.compile(r"\bIndex of /", re.I),
     re.compile(r"\bParent Directory\b", re.I),
@@ -1383,6 +1387,38 @@ def _detect_log_exposure_patterns(body: str) -> List[str]:
 
     return _dedup_preserve_order(matched_patterns)[:10]
 
+
+def _clean_runtime_error_message(level: str, message: str) -> str:
+    level_s = " ".join(str(level or "").split()).strip().title()
+    message_s = html.unescape(re.sub(r"<[^>]+>", " ", str(message or "")))
+    message_s = " ".join(message_s.replace("\ufffd", "").split()).strip(" .:")
+    if not level_s or not message_s:
+        return ""
+    return f"{level_s}: {message_s}"
+
+
+def _extract_runtime_error_messages(body: str) -> List[str]:
+    text = str(body or "")
+    if not text.strip():
+        return []
+
+    out: List[str] = []
+    for pattern in RUNTIME_ERROR_PATTERNS:
+        for match in pattern.finditer(text):
+            level = match.group(1)
+            message = match.group(2)
+            cleaned = _clean_runtime_error_message(level, message)
+            if not cleaned:
+                continue
+            lowered = cleaned.lower()
+            if len(cleaned) < 24:
+                continue
+            if any(tok in lowered for tok in ("<span", "</span>", "color:", "&lt;span")):
+                continue
+            out.append(cleaned)
+
+    return _dedup_preserve_order(out)[:10]
+
 def _body_content_type_hint(headers_lc: Dict[str, Any], body: str) -> str:
     ct = (_header_first(headers_lc, "content-type") or "").lower()
     if "json" in ct:
@@ -1613,6 +1649,7 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
     local_file_paths = [p for p in file_paths if _looks_like_local_filesystem_path(p)]
     internal_ips = _filter_meaningful_internal_ips(_find_matches(INTERNAL_IP_PATTERNS, body, 10))
     db_errors = _find_matches(DB_ERROR_PATTERNS, body, 10)
+    runtime_error_messages = _extract_runtime_error_messages(body)
     framework_hints = _find_matches(FRAMEWORK_HINT_PATTERNS, body, 10)
     debug_hints = _find_matches(DEBUG_HINT_PATTERNS, body, 10)
     directory_listing_hints = _find_matches(DIRECTORY_LISTING_PATTERNS, body, 10)
@@ -1944,6 +1981,7 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
         "file_paths_all_candidates": file_paths,
         "internal_ips": internal_ips,
         "db_errors": db_errors,
+        "runtime_error_messages": runtime_error_messages,
         "framework_hints": framework_hints,
         "debug_hints": debug_hints,
         "default_error_hint": default_error_hint,

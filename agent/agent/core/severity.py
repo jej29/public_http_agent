@@ -59,7 +59,6 @@ def apply_combination_severity(findings: List[Dict]) -> List[Dict]:
         return findings
 
     has_config = any(f.get("type") == "HTTP_CONFIG_FILE_EXPOSURE" for f in findings)
-    has_phpinfo = any(f.get("type") == "PHPINFO_EXPOSURE" for f in findings)
     has_error = any(f.get("type") == "HTTP_ERROR_INFO_EXPOSURE" for f in findings)
     has_directory = any(f.get("type") == "DIRECTORY_LISTING_ENABLED" for f in findings)
     has_default_resource = any(f.get("type") == "DEFAULT_FILE_EXPOSED" for f in findings)
@@ -72,12 +71,7 @@ def apply_combination_severity(findings: List[Dict]) -> List[Dict]:
             finding["severity"] = higher_severity(severity, "High")
             continue
 
-        if has_phpinfo and has_error and finding_type in {"PHPINFO_EXPOSURE", "HTTP_ERROR_INFO_EXPOSURE"}:
-            finding["severity"] = higher_severity(severity, "High")
-            continue
-
         if has_directory and has_default_resource and finding_type in {"DIRECTORY_LISTING_ENABLED", "DEFAULT_FILE_EXPOSED"}:
             finding["severity"] = higher_severity(severity, "High")
 
     return findings
-

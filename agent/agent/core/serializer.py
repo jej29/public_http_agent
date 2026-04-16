@@ -396,6 +396,8 @@ def _build_compact_evidence_summary(finding: Dict[str, Any]) -> Dict[str, Any]:
 
     if evidence.get("db_errors"):
         summary["db_errors"] = _dedup_str_list(evidence.get("db_errors") or [], limit=3)
+    if evidence.get("runtime_error_messages"):
+        summary["runtime_error_messages"] = _dedup_str_list(evidence.get("runtime_error_messages") or [], limit=3)
 
     if evidence.get("internal_ips"):
         summary["internal_ips"] = _dedup_str_list(evidence.get("internal_ips") or [], limit=5)
@@ -571,6 +573,8 @@ def _fallback_exposed_information_from_evidence(finding: Dict[str, Any]) -> List
 
     for x in evidence.get("db_errors") or []:
         out.append(f"Database error: {x}")
+    for x in evidence.get("runtime_error_messages") or []:
+        out.append(f"Error message: {x}")
 
     for x in evidence.get("phpinfo_indicators") or []:
         out.append(f"phpinfo indicator: {x}")
