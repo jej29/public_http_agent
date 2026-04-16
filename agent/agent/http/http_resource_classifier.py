@@ -836,13 +836,26 @@ def _build_config_exposure_signal(
             or setup_like_path
         )
     )
+    masked_key_classes = {
+        str(item.get("key_class") or "generic")
+        for item in masked_values
+        if str(item.get("key_class") or "").strip()
+    }
+    masked_db_context_count = len(masked_key_classes.intersection(db_context_classes))
+
     allow_config_exposure = (
         has_real_secret
-        or (has_real_db_context and len(real_values) >= 2)
         or html_db_setup_exposure
-        or (path_is_config_like and (config_like_body_kind or len(markers) >= 1))
         or len(real_values) >= 3
-        or len(markers) >= 4
+        or (has_real_db_context and len(real_values) >= 2)
+        or (
+            path_is_config_like
+            and config_like_body_kind
+            and (
+                len(real_values) >= 2
+                or masked_db_context_count >= 3
+            )
+        )
     )
     if not allow_config_exposure:
         return []

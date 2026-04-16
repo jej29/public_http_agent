@@ -35,8 +35,13 @@ def has_strong_phpinfo_evidence(candidate: Dict[str, Any]) -> bool:
 def has_strong_config_evidence(candidate: Dict[str, Any]) -> bool:
     evidence = evidence_dict(candidate)
     markers = evidence.get("config_exposure_markers") or []
-    if not markers:
-        return False
+    real_values = evidence.get("config_real_values") or []
+    masked_values = evidence.get("config_masked_values") or []
+    key_classes = {
+        str(item.get("key_class") or "").strip().lower()
+        for item in (real_values + masked_values)
+        if isinstance(item, dict) and str(item.get("key_class") or "").strip()
+    }
 
     strong_secret_markers = {
         "db_password",
@@ -49,7 +54,32 @@ def has_strong_config_evidence(candidate: Dict[str, Any]) -> bool:
         "connection_string",
         "secret",
     }
-    return any(m in strong_secret_markers for m in markers) or len(markers) >= 3
+    db_context_classes = {"db_host", "db_name", "db_user", "db_password", "db_port"}
+    exposed = joined_exposed(candidate)
+
+    if any(cls in strong_secret_markers for cls in key_classes):
+        return True
+    if len(key_classes.intersection(db_context_classes)) >= 3:
+        return True
+    if len(real_values) >= 3:
+        return True
+    if ":" in exposed and any(
+        token in exposed
+        for token in (
+            "database host:",
+            "database name:",
+            "database user:",
+            "database password:",
+            "connection string:",
+            "api key:",
+            "secret:",
+        )
+    ):
+        return True
+
+    if not markers:
+        return False
+    return False
 
 
 def has_strong_log_evidence(candidate: Dict[str, Any]) -> bool:
@@ -206,7 +236,7 @@ def has_concrete_body_exposure(candidate: Dict[str, Any]) -> bool:
         return has_strong_phpinfo_evidence(candidate)
 
     if candidate_type == "HTTP_CONFIG_FILE_EXPOSURE":
-        return bool(evidence.get("config_exposure_markers"))
+        return has_strong_config_evidence(candidate)
 
     if candidate_type == "LOG_VIEWER_EXPOSURE":
         return len(evidence.get("log_exposure_patterns") or []) >= 2
@@ -291,4 +321,3 @@ def has_concrete_default_resource_exposure(candidate: Dict[str, Any], snapshot: 
 
     hints = evidence.get("default_file_hints") or []
     return bool(hints) and not has_error_like_exposure_snapshot(candidate, snapshot)
-

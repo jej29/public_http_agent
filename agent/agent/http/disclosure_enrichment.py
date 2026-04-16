@@ -66,6 +66,41 @@ def _looks_like_setup_or_install_page(final_url: str, body_text: str) -> bool:
     )
 
 
+def _has_strong_config_payload(feats: Dict[str, Any]) -> bool:
+    extracted_values = feats.get("config_extracted_values") or []
+    real_values = [
+        item
+        for item in extracted_values
+        if isinstance(item, dict) and not bool(item.get("masked"))
+    ]
+    if len(real_values) >= 3:
+        return True
+
+    key_classes = set()
+    for item in extracted_values:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip().lower()
+        if not key:
+            continue
+        if "password" in key:
+            key_classes.add("db_password")
+        if key in {"db_host", "database_host", "host"}:
+            key_classes.add("db_host")
+        if key in {"db_name", "database", "dbname"}:
+            key_classes.add("db_name")
+        if key in {"db_user", "database_user", "username", "user"}:
+            key_classes.add("db_user")
+        if "secret" in key or "token" in key or "api_key" in key or "access_key" in key:
+            key_classes.add("secret")
+
+    if len(key_classes.intersection({"db_host", "db_name", "db_user", "db_password"})) >= 3:
+        return True
+    if "secret" in key_classes or "db_password" in key_classes:
+        return True
+    return False
+
+
 def _why_and_rec(disclosure_type: DisclosureType) -> tuple[str, List[str]]:
     mapping = {
         DisclosureType.STACK_TRACE: (
@@ -275,6 +310,8 @@ def build_detector_disclosure_signals(
             continue
 
         if signal.disclosure_type == DisclosureType.CONFIG_EXPOSURE:
+            if not _has_strong_config_payload(feats):
+                continue
             evidence["config_exposure_markers"] = _dedup(signal.evidence)
             out.append(
                 _build_signal(
@@ -299,6 +336,8 @@ def build_detector_disclosure_signals(
             continue
 
         if signal.disclosure_type == DisclosureType.SOURCE_CODE:
+            if not _has_strong_config_payload(feats):
+                continue
             evidence["source_code_markers"] = _dedup(signal.evidence)
             out.append(
                 _build_signal(
