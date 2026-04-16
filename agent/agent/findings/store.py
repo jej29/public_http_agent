@@ -291,6 +291,12 @@ def _dominates(stronger: Dict[str, Any], weaker: Dict[str, Any]) -> bool:
     if stronger_type == "HTTP_ERROR_INFO_EXPOSURE" and weaker_type == "DEFAULT_FILE_EXPOSED":
         return True
 
+    if stronger_type == "HTTP_ERROR_INFO_EXPOSURE" and weaker_type == "FILE_PATH_HANDLING_ANOMALY":
+        return True
+
+    if stronger_type == "HTTP_CONFIG_FILE_EXPOSURE" and weaker_type == "FILE_PATH_HANDLING_ANOMALY":
+        return True
+
     if stronger_type == "FILE_PATH_HANDLING_ANOMALY" and weaker_type == "DEFAULT_FILE_EXPOSED":
         return weaker_subtype == "default_resource"
 
@@ -585,4 +591,3 @@ def persist_finding_map(run_dir: Path, verdict_dirname: str, finding_map: Dict[s
         persisted.append(finding)
 
     return persisted 
-

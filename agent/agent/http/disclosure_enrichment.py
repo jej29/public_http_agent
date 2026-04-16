@@ -58,6 +58,14 @@ def _technology_fingerprint(feats: Dict[str, Any]) -> List[str]:
     return _dedup([str(x).strip() for x in (feats.get("technology_fingerprint") or []) if str(x).strip()])
 
 
+def _looks_like_setup_or_install_page(final_url: str, body_text: str) -> bool:
+    final_url_l = str(final_url or "").lower()
+    body_l = str(body_text or "").lower()
+    return any(token in final_url_l for token in ("setup", "install", "installer", "instructions")) or any(
+        token in body_l for token in ("setup", "installation", "installer", "instructions")
+    )
+
+
 def _why_and_rec(disclosure_type: DisclosureType) -> tuple[str, List[str]]:
     mapping = {
         DisclosureType.STACK_TRACE: (
@@ -167,6 +175,7 @@ def build_detector_disclosure_signals(
     requested_url = str(request_meta.get("url") or "")
     final_url = str(feats.get("final_url") or snapshot.get("final_url") or requested_url)
     status_code = feats.get("status_code") or snapshot.get("status_code")
+    setup_or_install_page = _looks_like_setup_or_install_page(final_url, body)
 
     if not body and not headers:
         return []
@@ -240,6 +249,8 @@ def build_detector_disclosure_signals(
             continue
 
         if signal.disclosure_type == DisclosureType.FILE_PATH:
+            if setup_or_install_page:
+                continue
             evidence["file_paths"] = _dedup(signal.evidence)
             out.append(
                 _build_signal(

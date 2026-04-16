@@ -823,9 +823,23 @@ def _build_config_exposure_signal(
 
     has_real_secret = bool(real_key_classes.intersection(strong_secret_classes))
     has_real_db_context = bool(real_key_classes.intersection(db_context_classes))
+    distinct_db_context_count = len(real_key_classes.intersection(db_context_classes))
+    setup_like_path = any(token in path_l for token in ("setup", "install", "installer"))
+    html_db_setup_exposure = (
+        distinct_db_context_count >= 3
+        and (
+            has_real_secret
+            or "database" in markers
+            or "db_user" in markers
+            or "db_host" in markers
+            or "db_password" in markers
+            or setup_like_path
+        )
+    )
     allow_config_exposure = (
         has_real_secret
         or (has_real_db_context and len(real_values) >= 2)
+        or html_db_setup_exposure
         or (path_is_config_like and (config_like_body_kind or len(markers) >= 1))
         or len(real_values) >= 3
         or len(markers) >= 4
@@ -834,7 +848,7 @@ def _build_config_exposure_signal(
         return []
 
     exposed_information = _format_config_exposed_information(extracted_summary, markers)
-    severity = "High" if has_real_secret or len(real_values) >= 3 else "Medium"
+    severity = "High" if has_real_secret or len(real_values) >= 3 or html_db_setup_exposure else "Medium"
     confidence = 0.94 if severity == "High" else 0.86
 
     representative_leak = final_url
@@ -863,6 +877,8 @@ def _build_config_exposure_signal(
                 "config_masked_values": masked_values[:12],
                 "config_interesting_values": interesting_values[:12],
                 "config_key_classes": sorted(real_key_classes),
+                "distinct_db_context_count": distinct_db_context_count,
+                "html_db_setup_exposure": html_db_setup_exposure,
                 "body_content_type_hint": feats.get("body_content_type_hint"),
                 "path_is_config_like": path_is_config_like,
                 "config_like_body_kind": config_like_body_kind,

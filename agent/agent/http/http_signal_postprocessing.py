@@ -3,22 +3,58 @@ from __future__ import annotations
 from typing import Any, Dict, List, Set
 
 
+def _severity_rank(severity: str) -> int:
+    ranking = {"Critical": 5, "High": 4, "Medium": 3, "Low": 2, "Info": 1}
+    return ranking.get(str(severity or "Info"), 1)
+
+
+def _evidence_size(item: Dict[str, Any]) -> int:
+    evidence = item.get("evidence") or {}
+    score = 0
+    for value in evidence.values():
+        if isinstance(value, list):
+            score += len(value)
+        elif isinstance(value, dict):
+            score += len(value)
+        elif value not in (None, "", False):
+            score += 1
+    score += len(item.get("exposed_information") or [])
+    return score
+
+
 def dedupe_signals(signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    deduped: List[Dict[str, Any]] = []
-    seen = set()
+    kept_by_marker: Dict[tuple[str, str, str, str, str], Dict[str, Any]] = {}
     for item in signals or []:
+        finding_type = str(item.get("finding_type") or "")
+        subtype = str(item.get("subtype") or "")
+        root_cause_signature = str(item.get("root_cause_signature") or "")
+        if finding_type in {"HTTP_ERROR_INFO_EXPOSURE", "HTTP_CONFIG_FILE_EXPOSURE", "FILE_PATH_HANDLING_ANOMALY"}:
+            subtype = ""
+            root_cause_signature = ""
         marker = (
-            str(item.get("finding_type") or ""),
-            str(item.get("subtype") or ""),
+            finding_type,
+            subtype,
             str(item.get("policy_object") or ""),
-            str(item.get("root_cause_signature") or ""),
+            root_cause_signature,
             str((item.get("evidence") or {}).get("final_url") or ""),
         )
-        if marker in seen:
+        existing = kept_by_marker.get(marker)
+        if existing is None:
+            kept_by_marker[marker] = item
             continue
-        seen.add(marker)
-        deduped.append(item)
-    return deduped
+        current_rank = (
+            _severity_rank(item.get("severity", "Info")),
+            float(item.get("confidence") or 0),
+            _evidence_size(item),
+        )
+        existing_rank = (
+            _severity_rank(existing.get("severity", "Info")),
+            float(existing.get("confidence") or 0),
+            _evidence_size(existing),
+        )
+        if current_rank > existing_rank:
+            kept_by_marker[marker] = item
+    return list(kept_by_marker.values())
 
 
 def finalize_http_signals(
@@ -63,6 +99,12 @@ def finalize_http_signals(
                 "HTTP_CONFIG_FILE_EXPOSURE",
                 "HTTP_ERROR_INFO_EXPOSURE",
             }):
+                continue
+
+        if finding_type == "FILE_PATH_HANDLING_ANOMALY":
+            if "HTTP_ERROR_INFO_EXPOSURE" in same_url_types:
+                continue
+            if "HTTP_CONFIG_FILE_EXPOSURE" in same_url_types:
                 continue
 
         if finding_type == "DEFAULT_FILE_EXPOSED":
