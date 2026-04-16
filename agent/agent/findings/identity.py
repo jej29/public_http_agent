@@ -292,6 +292,14 @@ def stable_key(finding: Dict[str, Any]) -> str:
         ])
 
     if ftype == "HTTP_SYSTEM_INFO_EXPOSURE":
+        if subtype == "banner_header":
+            return "||".join([
+                group,
+                ftype,
+                host_scope or _host_scope(trigger_url) or disclosure_url or normalized_final_url,
+                subtype,
+                policy_object or "response_headers",
+            ])
         scope = disclosure_url or route_scope or host_scope or normalized_final_url
         return "||".join([
             group,
@@ -330,4 +338,3 @@ def stable_finding_filename(finding: Dict[str, Any]) -> str:
 
     slug = _slugify(path.strip("/") or "root")
     return f"{cwe}_{ftype}_{slug}.json"
-

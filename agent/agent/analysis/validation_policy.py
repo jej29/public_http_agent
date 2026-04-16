@@ -10,6 +10,7 @@ from agent.core.evidence_policy import (
     is_low_value_disclosure,
 )
 from agent.findings.types import AMBIGUOUS_TYPES, CONCRETE_EXPOSURE_TYPES, DETERMINISTIC_TYPES
+from agent.llm_client import normalize_exposure_with_llm
 
 
 def _evidence(candidate: Dict[str, Any]) -> Dict[str, Any]:
@@ -40,6 +41,38 @@ def _ensure_verification(candidate: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _apply_final_verdict_state(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    raw_items = candidate.get("exposed_information_raw")
+    if not isinstance(raw_items, list) or not raw_items:
+        raw_items = list(candidate.get("exposed_information") or [])
+    candidate["exposed_information_raw"] = [str(x).strip() for x in raw_items if str(x).strip()][:8]
+
+    try:
+        reviewed = normalize_exposure_with_llm(
+            candidate["exposed_information_raw"],
+            str(candidate.get("final_severity") or candidate.get("severity") or "Info"),
+            str(candidate.get("title") or ""),
+        )
+    except Exception:
+        reviewed = {
+            "exposed_information_normalized": candidate["exposed_information_raw"][:5],
+            "severity_reason": [],
+            "evidence_review": {"mode": "fallback_error"},
+        }
+
+    normalized_items = [
+        str(x).strip()
+        for x in (reviewed.get("exposed_information_normalized") or [])
+        if str(x).strip()
+    ][:6]
+    if normalized_items:
+        candidate["normalized_exposed_information"] = normalized_items
+    else:
+        candidate.pop("normalized_exposed_information", None)
+
+    review_meta = reviewed.get("evidence_review")
+    if isinstance(review_meta, dict) and review_meta:
+        candidate["llm_evidence_review"] = review_meta
+
     verification = _ensure_verification(candidate)
     verdict = str(verification.get("verdict") or "").upper()
 
@@ -81,17 +114,53 @@ def _has_local_file_path(candidate: Dict[str, Any]) -> bool:
     return False
 
 
+def _meaningful_stack_trace_values(items: list[Any]) -> list[str]:
+    out: list[str] = []
+    for item in items or []:
+        value = " ".join(str(item or "").replace("\ufffd", "").split()).strip()
+        lowered = value.lower()
+        if not value:
+            continue
+        if lowered in {"fatal error", "stack trace", "exception", "traceback", "stack trace: fatal error"}:
+            continue
+        if len(value) < 18:
+            continue
+        if any(token in lowered for token in ("<span", "</span>", "color:", "&lt;span")):
+            continue
+        if any(marker in lowered for marker in (" in /", " on line ", "traceback (most recent call last)", "caused by:", "#0 ", "stack trace:")):
+            out.append(value)
+    return out
+
+
+def _meaningful_db_error_values(items: list[Any]) -> list[str]:
+    out: list[str] = []
+    for item in items or []:
+        value = " ".join(str(item or "").replace("\ufffd", "").split()).strip()
+        lowered = value.lower()
+        if not value:
+            continue
+        if lowered in {"sqlite3.", "sqlite3", "mysql", "postgres", "oracle"}:
+            continue
+        if len(value) < 18:
+            continue
+        if any(token in lowered for token in ("<span", "</span>", "color:", "&lt;span")):
+            continue
+        if any(marker in lowered for marker in ("sqlstate", "syntax error", "odbc", "pdoexception", "mysqli", "postgresql", "oracle error", "sqlite error", "database error", "query failed", "sql error", "warning: mysql", "warning: mysqli", "ora-")):
+            out.append(value)
+    return out
+
+
 def _is_concrete_error_disclosure(candidate: Dict[str, Any]) -> bool:
     evidence = _evidence(candidate)
     status_code = candidate.get("status_code") or evidence.get("status_code")
 
-    stack_traces = evidence.get("stack_traces") or []
+    stack_traces = _meaningful_stack_trace_values(evidence.get("stack_traces") or [])
     file_paths = evidence.get("file_paths") or []
-    db_errors = evidence.get("db_errors") or []
+    db_errors = _meaningful_db_error_values(evidence.get("db_errors") or [])
     debug_hints = evidence.get("debug_hints") or []
     default_error_hint = evidence.get("default_error_hint")
 
-    if db_errors:
+    if db_errors and (status_code in {400, 401, 403, 404, 405, 500, 502, 503} or stack_traces or len(debug_hints) >= 1):
         return True
 
     if stack_traces:
@@ -289,11 +358,11 @@ def _is_phpinfo_route_error_false_positive(candidate: Dict[str, Any]) -> bool:
 
     stack_traces = evidence.get("stack_traces") or []
     file_paths = evidence.get("file_paths") or []
-    db_errors = evidence.get("db_errors") or []
+    db_errors = _meaningful_db_error_values(evidence.get("db_errors") or [])
     phpinfo_indicators = evidence.get("phpinfo_indicators") or []
 
     # 吏꾩쭨 stack/file path ?몄텧?대㈃ error finding ?좎? 媛??
-    if stack_traces:
+    if _meaningful_stack_trace_values(stack_traces):
         return False
     if file_paths and _has_local_file_path(candidate):
         return False

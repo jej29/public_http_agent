@@ -321,6 +321,52 @@ def _build_cookie_signals(
                 policy_object=name, root_cause_signature=f"cookie:{name}|{subtype}", technology_fingerprint=technology_fingerprint,
                 cwe_mapping_status=mapping_status, cwe_mapping_reason=mapping_reason,
             ))
+
+    if not is_https_response:
+        inferred_secure_missing_names = sorted(
+            {
+                name
+                for name in request_sensitive_cookie_names
+                if name and name not in response_cookie_names
+            }
+        )
+        for cookie_name in inferred_secure_missing_names:
+            dedup_key = (cookie_name.lower(), "secure_missing_inferred")
+            if dedup_key in seen_cookie_issue_keys:
+                continue
+            seen_cookie_issue_keys.add(dedup_key)
+            out.append(build_signal(
+                signal_type="missing_cookie_attr",
+                finding_type="COOKIE_SECURE_MISSING",
+                family="COOKIE_SECURITY",
+                subtype="secure_missing_inferred",
+                title=f"Cookie '{cookie_name}' was observed over HTTP without Secure protection",
+                severity="Low",
+                confidence=0.86,
+                where="request.headers",
+                evidence={
+                    "response_kind": response_kind,
+                    "cookie_name": cookie_name,
+                    "cookie_sensitive": True,
+                    "auth_context": auth_context,
+                    "request_sensitive_cookie_names": sorted(request_sensitive_cookie_names),
+                    "request_sensitive_cookie_names_missing_in_response": sorted(request_sensitive_cookie_names_missing_in_response),
+                    "response_cookie_names": sorted(response_cookie_names),
+                    "is_https_response": is_https_response,
+                    "final_url": final_url,
+                    "requested_url": requested_url,
+                    "inference_basis": "cookie_observed_in_http_request",
+                },
+                exposed_information=[f"Sensitive cookie observed over HTTP: {cookie_name}"],
+                leak_type="cookie_secure_missing",
+                leak_value=cookie_name,
+                cwe="CWE-614",
+                owasp="A05:2021 Security Misconfiguration",
+                scope_hint="cookie-specific",
+                policy_object=cookie_name,
+                root_cause_signature=f"cookie:{cookie_name}|secure_missing_inferred",
+                technology_fingerprint=technology_fingerprint,
+            ))
     return out
 
 

@@ -146,7 +146,12 @@ def _details_title(finding: Dict[str, Any]) -> str:
 
 
 def _details_section(finding: Dict[str, Any]) -> str:
-    items = _dedup(finding.get("exposed_information") or finding.get("missing_security_controls") or [])
+    items = _dedup(
+        finding.get("normalized_exposed_information")
+        or finding.get("exposed_information")
+        or finding.get("missing_security_controls")
+        or []
+    )
     return f"## {_details_title(finding)}\n\n{_list_to_md(items)}\n"
 
 
@@ -239,6 +244,9 @@ def _compact_finding_json(finding: Dict[str, Any]) -> Dict[str, Any]:
         "trigger_count": _finding_instance_count(finding),
         "final_urls": _dedup(finding.get("final_urls") or []),
         "triggers": build_reproduction_summary(finding)["trigger_requests"],
+        "normalized_exposed_information": _dedup(finding.get("normalized_exposed_information") or []),
+        "exposed_information_raw": _dedup(finding.get("exposed_information_raw") or []),
+        "llm_evidence_review": finding.get("llm_evidence_review") or {},
         "exposed_information": _dedup(finding.get("exposed_information") or []),
         "missing_security_controls": _dedup(finding.get("missing_security_controls") or []),
         "severity_reason": _dedup(finding.get("severity_reason") or []),

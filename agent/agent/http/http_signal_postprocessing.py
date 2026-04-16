@@ -76,6 +76,7 @@ def finalize_http_signals(
         subtype = str(item.get("subtype") or "")
         item_final_url = str((item.get("evidence") or {}).get("final_url") or "")
         same_url_types = final_url_to_types.get(item_final_url, set())
+        evidence = item.get("evidence") or {}
 
         if finding_type == "HTTP_SYSTEM_INFO_EXPOSURE":
             if "PHPINFO_EXPOSURE" in same_url_types:
@@ -105,6 +106,11 @@ def finalize_http_signals(
             if "HTTP_ERROR_INFO_EXPOSURE" in same_url_types:
                 continue
             if "HTTP_CONFIG_FILE_EXPOSURE" in same_url_types:
+                continue
+
+        if finding_type == "HTTP_ERROR_INFO_EXPOSURE":
+            only_file_paths = bool(evidence.get("file_paths")) and not bool(evidence.get("stack_traces") or evidence.get("db_errors"))
+            if "PHPINFO_EXPOSURE" in same_url_types and only_file_paths:
                 continue
 
         if finding_type == "DEFAULT_FILE_EXPOSED":

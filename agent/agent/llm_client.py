@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -822,11 +823,51 @@ def normalize_exposure_with_llm(
     severity: Optional[str],
     title: Optional[str],
 ) -> Dict[str, Any]:
-    if os.getenv("LLM_MODE", "off").lower() != "on":
+    def _heuristic_review(items: List[str]) -> Dict[str, Any]:
+        kept: List[str] = []
+        dropped: List[Dict[str, str]] = []
+
+        for raw in raw_exposed_information or []:
+            text = html.unescape(str(raw or "")).replace("\ufffd", "").strip()
+            text = re.sub(r"\s+", " ", text)
+            if not text:
+                continue
+
+            reason = ""
+            lowered = text.lower()
+            if lowered in {"sqlite3.", "sqlite3", "array (", "array(", "{}", "[]", "null", "none"}:
+                reason = "generic_or_incomplete_value"
+            elif text.count("*") >= max(4, len(text) // 2):
+                reason = "heavily_masked_value"
+            elif lowered.startswith("masked configuration value present:"):
+                reason = "metadata_only"
+            elif lowered == "application configuration details disclosed":
+                reason = "generic_summary_only"
+            elif lowered.startswith("phpinfo indicator:"):
+                reason = "indicator_only"
+            elif lowered.startswith("token: ") and len(text.split(":", 1)[-1].strip()) < 12:
+                reason = "short_or_non_secret_token"
+
+            if reason:
+                dropped.append({"value": text, "reason": reason})
+                continue
+
+            if text not in kept:
+                kept.append(text)
+
         return {
-            "exposed_information_normalized": _dedup_str_list(raw_exposed_information, limit=5),
+            "exposed_information_normalized": _dedup_str_list(kept, limit=5),
             "severity_reason": [],
+            "evidence_review": {
+                "mode": "heuristic_fallback",
+                "kept_count": len(kept),
+                "dropped_count": len(dropped),
+                "dropped_examples": dropped[:5],
+            },
         }
+
+    if os.getenv("LLM_MODE", "off").lower() != "on":
+        return _heuristic_review(raw_exposed_information)
 
     client = build_client()
     model = os.getenv("OPENAI_MODEL", "gpt-oss-120b")
@@ -896,12 +937,14 @@ Return ONLY JSON:
         return {
             "exposed_information_normalized": [str(x).strip() for x in normalized if str(x).strip()][:5],
             "severity_reason": [str(x).strip() for x in severity_reason if str(x).strip()][:5],
+            "evidence_review": {
+                "mode": "llm",
+                "kept_count": len([str(x).strip() for x in normalized if str(x).strip()][:5]),
+                "dropped_count": max(0, len(raw_exposed_information or []) - len([str(x).strip() for x in normalized if str(x).strip()][:5])),
+            },
         }
     except Exception:
-        return {
-            "exposed_information_normalized": _dedup_str_list(raw_exposed_information, limit=5),
-            "severity_reason": [],
-        }
+        return _heuristic_review(raw_exposed_information)
 
 def _fallback_additional_probes(target: str, observation_summary: Dict[str, Any]) -> List[Dict[str, Any]]:
     target = (target or "").rstrip("/")

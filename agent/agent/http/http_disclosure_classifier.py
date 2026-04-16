@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+import re
 from typing import Any, Dict, List
 
 from agent.http.disclosure_enrichment import build_detector_disclosure_signals
@@ -16,6 +18,98 @@ def _dedup(items: List[str]) -> List[str]:
         seen.add(value)
         out.append(value)
     return out
+
+
+def _clean_disclosure_text(value: str) -> str:
+    text = html.unescape(str(value or "")).replace("\ufffd", "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _looks_like_meaningful_stack_trace(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered in {
+        "fatal error",
+        "stack trace",
+        "exception",
+        "traceback",
+        "stack trace: fatal error",
+    }:
+        return False
+    if len(lowered) < 18:
+        return False
+    if any(token in lowered for token in ("<span", "</span>", "color:", "&lt;span")):
+        return False
+    meaningful_markers = (
+        " in /",
+        " on line ",
+        "traceback (most recent call last)",
+        " at ",
+        "caused by:",
+        "uncaught ",
+        "warning:",
+        "notice:",
+        "exception:",
+        "fatal error:",
+        "#0 ",
+        "stack trace:",
+    )
+    return any(marker in lowered for marker in meaningful_markers)
+
+
+def _meaningful_stack_traces(items: List[str]) -> List[str]:
+    out: List[str] = []
+    for item in items or []:
+        text = _clean_disclosure_text(item)
+        if not _looks_like_meaningful_stack_trace(text):
+            continue
+        out.append(text)
+    return _dedup(out)
+
+
+def _meaningful_db_errors(items: List[str]) -> List[str]:
+    out: List[str] = []
+    for item in items or []:
+        text = _clean_disclosure_text(item)
+        if not text:
+            continue
+        if text.lower() in {"sqlite3.", "sqlite3", "mysql", "postgres", "oracle"}:
+            continue
+        if len(text) < 12:
+            continue
+        lowered = text.lower()
+        if not any(
+            marker in lowered
+            for marker in (
+                "sqlstate",
+                "syntax error",
+                "mysqli",
+                "pdoexception",
+                "warning: mysql",
+                "warning: mysqli",
+                "postgresql",
+                "sqlite error",
+                "database error",
+                "query failed",
+                "ora-",
+                "sql error",
+            )
+        ):
+            continue
+        out.append(text)
+    return _dedup(out)
+
+
+def _meaningful_file_paths(items: List[str]) -> List[str]:
+    out: List[str] = []
+    for item in items or []:
+        text = _clean_disclosure_text(item)
+        if not text:
+            continue
+        out.append(text.rstrip(" '\""))
+    return _dedup(out)
 
 
 def _first(items: List[str]) -> str:
@@ -167,22 +261,27 @@ def _build_error_disclosure_signals(
     tech: str,
 ) -> List[Dict[str, Any]]:
     error_class = str(feats.get("error_exposure_class") or "")
-    stack_traces = _dedup(feats.get("stack_traces") or [])
-    file_paths = _dedup(feats.get("file_paths") or [])
-    db_errors = _dedup(feats.get("db_errors") or [])
+    stack_traces = _meaningful_stack_traces(feats.get("stack_traces") or [])
+    file_paths = _meaningful_file_paths(feats.get("file_paths") or [])
+    db_errors = _meaningful_db_errors(feats.get("db_errors") or [])
     debug_hints = _dedup(feats.get("debug_hints") or [])
     default_error_hint = str(feats.get("default_error_hint") or "")
     template_fingerprint = str(feats.get("error_template_fingerprint") or "")
 
     exposed_information: List[str] = []
-    exposed_information.extend([f"Stack trace: {item}" for item in stack_traces[:2]])
+    exposed_information.extend([f"Stack trace: {_clean_disclosure_text(item)}" for item in stack_traces[:2]])
     exposed_information.extend([f"File path: {item}" for item in file_paths[:3]])
     exposed_information.extend([f"Database error: {item}" for item in db_errors[:2]])
-    exposed_information.extend([f"Debug hint: {item}" for item in debug_hints[:2]])
+    exposed_information.extend([f"Debug hint: {_clean_disclosure_text(item)}" for item in debug_hints[:2]])
     if default_error_hint:
         exposed_information.append(f"Default error template: {default_error_hint}")
     exposed_information = _dedup(exposed_information)
+    has_concrete_error_artifact = bool(stack_traces or file_paths or db_errors)
     if not exposed_information and not error_class:
+        return []
+    if not has_concrete_error_artifact and error_class in {"stack_trace", "db_error"}:
+        return []
+    if not has_concrete_error_artifact and default_error_hint and len(debug_hints) < 2:
         return []
 
     severity = "High" if db_errors or stack_traces or file_paths else "Medium"
@@ -282,7 +381,7 @@ def _build_header_disclosure_signals(
             leak_value=_first(exposed_information) or final_url,
             cwe="CWE-497",
             owasp="A05:2021 Security Misconfiguration",
-            scope_hint="route-specific",
+            scope_hint="host-wide",
             policy_object="response_headers",
             root_cause_signature=f"headers:{'|'.join(str(x.get('subtype') or '') for x in banner_headers)}|tech:{tech}",
             technology_fingerprint=technology_fingerprint,

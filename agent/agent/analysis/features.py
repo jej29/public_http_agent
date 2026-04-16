@@ -181,7 +181,12 @@ KV_REGEXES = [
     re.compile(r"(?i)\b([a-zA-Z0-9_\-\.]{3,})\s*:\s*([^\n#]+)"),  # yaml
     re.compile(r"(?i)define\s*\(\s*[\"']([A-Z0-9_\-]+)[\"']\s*,\s*[\"']([^\"']+)[\"']\s*\)"),  # php define
     re.compile(r"(?i)\$([a-zA-Z0-9_\-]+)\s*=\s*[\"']([^\"']+)[\"']"),  # php var
-    re.compile(r"(?is)\[\s*[\"']([a-zA-Z0-9_\-\.]{3,})[\"']\s*\]\s*=\s*[\"']([^\"'\r\n]{1,200})[\"']"),  # php array key assignment
+    re.compile(
+        r"(?is)(?:\$_[A-Za-z0-9_]+\s*)?\[\s*[\"']\s*([a-zA-Z0-9_\-\.]{3,})\s*[\"']\s*\]\s*=\s*getenv\([^)]*\)\s*\?:\s*[\"']([^\"'\r\n]{1,200})[\"']"
+    ),  # php array assignment with getenv fallback
+    re.compile(
+        r"(?is)(?:\$_[A-Za-z0-9_]+\s*)?\[\s*[\"']\s*([a-zA-Z0-9_\-\.]{3,})\s*[\"']\s*\]\s*=\s*[\"']([^\"'\r\n]{1,200})[\"']"
+    ),  # php array key assignment
 ]
 
 HTML_LABEL_VALUE_REGEXES = [
@@ -1261,8 +1266,8 @@ def _detect_error_exposure_class(
         if status_code >= 400:
             return "db_error"
 
-        # 2xx라도 stack/file/debug context가 같이 있을 때만 인정
-        if local_paths:
+        # 2xx라도 stack/debug context가 같이 있을 때만 인정
+        if stack_traces and len(db_errors) >= 1:
             return "db_error"
 
         if len(db_errors) >= 2 and len(debug_hints or []) >= 1:

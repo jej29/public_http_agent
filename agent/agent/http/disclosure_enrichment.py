@@ -58,6 +58,88 @@ def _technology_fingerprint(feats: Dict[str, Any]) -> List[str]:
     return _dedup([str(x).strip() for x in (feats.get("technology_fingerprint") or []) if str(x).strip()])
 
 
+def _clean_signal_evidence(items: List[str]) -> List[str]:
+    out: List[str] = []
+    for item in items or []:
+        value = str(item or "").replace("\ufffd", "").strip()
+        value = " ".join(value.split())
+        if not value:
+            continue
+        out.append(value)
+    return _dedup(out)
+
+
+def _is_low_value_stack_trace(items: List[str]) -> bool:
+    cleaned = _clean_signal_evidence(items)
+    if not cleaned:
+        return True
+    meaningful_markers = (" in /", " on line ", "traceback (most recent call last)", "caused by:", "#0 ", "stack trace:")
+    meaningful = [
+        item for item in cleaned
+        if any(marker in item.lower() for marker in meaningful_markers)
+        and not any(token in item.lower() for token in ("<span", "</span>", "color:", "&lt;span"))
+    ]
+    return not meaningful
+
+
+def _is_low_value_db_error(items: List[str]) -> bool:
+    cleaned = _clean_signal_evidence(items)
+    if not cleaned:
+        return True
+    joined = " ".join(cleaned).lower()
+    if any(token in joined for token in ("<span", "</span>", "color:", "&lt;span")):
+        return True
+    if cleaned == ["sqlite3."] or cleaned == ["sqlite3"]:
+        return True
+    strong_markers = (
+        "sqlstate",
+        "syntax error",
+        "mysqli",
+        "pdoexception",
+        "warning: mysql",
+        "warning: mysqli",
+        "postgresql",
+        "sqlite error",
+        "database error #",
+        "database error:",
+        "query failed",
+        "ora-",
+        "sql error",
+    )
+    return not any(marker in joined for marker in strong_markers)
+
+
+def _is_marker_only_config_signal(items: List[str]) -> bool:
+    cleaned = _clean_signal_evidence(items)
+    if not cleaned:
+        return True
+    if len(cleaned) == 1 and cleaned[0].lower() in {"db_password", "db_user", "database", "config", "<?php\\s"}:
+        return True
+    return all(
+        len(item) <= 32
+        and ":" not in item
+        and "=" not in item
+        and "\n" not in item
+        for item in cleaned
+    )
+
+
+def _classification_kind_for_detector(signal: DisclosureSignal, evidence_items: List[str]) -> str:
+    if signal.disclosure_type in {
+        DisclosureType.VERSION_DISCLOSURE,
+        DisclosureType.FRAMEWORK_HINT,
+        DisclosureType.INTERNAL_STRUCTURE,
+    }:
+        return "supporting_signal"
+    if signal.disclosure_type == DisclosureType.STACK_TRACE and _is_low_value_stack_trace(evidence_items):
+        return "supporting_signal"
+    if signal.disclosure_type == DisclosureType.DB_ERROR and _is_low_value_db_error(evidence_items):
+        return "supporting_signal"
+    if signal.disclosure_type in {DisclosureType.CONFIG_EXPOSURE, DisclosureType.SOURCE_CODE}:
+        return "supporting_signal"
+    return "finding"
+
+
 def _looks_like_setup_or_install_page(final_url: str, body_text: str) -> bool:
     final_url_l = str(final_url or "").lower()
     body_l = str(body_text or "").lower()
@@ -81,7 +163,10 @@ def _has_strong_config_payload(feats: Dict[str, Any]) -> bool:
         if not isinstance(item, dict):
             continue
         key = str(item.get("key") or "").strip().lower()
+        value = str(item.get("value") or "").strip()
         if not key:
+            continue
+        if not value or value.lower() in {"array (", "array(", "{}", "[]", "null", "none"}:
             continue
         if "password" in key:
             key_classes.add("db_password")
@@ -91,7 +176,7 @@ def _has_strong_config_payload(feats: Dict[str, Any]) -> bool:
             key_classes.add("db_name")
         if key in {"db_user", "database_user", "username", "user"}:
             key_classes.add("db_user")
-        if "secret" in key or "token" in key or "api_key" in key or "access_key" in key:
+        if "secret" in key or "api_key" in key or "access_key" in key:
             key_classes.add("secret")
 
     if len(key_classes.intersection({"db_host", "db_name", "db_user", "db_password"})) >= 3:
@@ -193,7 +278,7 @@ def _build_signal(
         "signal_repeatability": "likely_stable",
         "observation_scope": "route_behavior",
         "verification_strategy": "rule_based_detector",
-        "classification_kind": "finding",
+        "classification_kind": _classification_kind_for_detector(signal, exposed_information),
         "burp_zap_aligned": True,
     }
 
@@ -313,6 +398,8 @@ def build_detector_disclosure_signals(
             if not _has_strong_config_payload(feats):
                 continue
             evidence["config_exposure_markers"] = _dedup(signal.evidence)
+            if _is_marker_only_config_signal(evidence["config_exposure_markers"]):
+                continue
             out.append(
                 _build_signal(
                     signal=signal,
@@ -339,6 +426,8 @@ def build_detector_disclosure_signals(
             if not _has_strong_config_payload(feats):
                 continue
             evidence["source_code_markers"] = _dedup(signal.evidence)
+            if _is_marker_only_config_signal(evidence["source_code_markers"]):
+                continue
             out.append(
                 _build_signal(
                     signal=signal,

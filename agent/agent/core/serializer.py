@@ -1,4 +1,5 @@
 from __future__ import annotations
+import html
 from typing import Any, Dict, List
 from copy import deepcopy
 
@@ -64,6 +65,35 @@ def _dedup_str_list(items: List[Any], limit: int | None = None) -> List[str]:
             break
 
     return out
+
+
+def _sanitize_exposed_item(finding: Dict[str, Any], item: Any) -> str | None:
+    text = html.unescape(str(item or "")).replace("\ufffd", "").strip()
+    text = " ".join(text.split())
+    if not text:
+        return None
+
+    ftype = str(finding.get("type") or "")
+
+    if text.lower() in {"sqlite3.", "sqlite3", "array (", "array("}:
+        return None
+
+    if text.count("*") >= max(4, len(text) // 2):
+        return None
+
+    if ftype == "HTTP_CONFIG_FILE_EXPOSURE":
+        if text.startswith("Masked configuration value present:"):
+            return None
+        if text == "Application configuration details disclosed":
+            return None
+        if text.startswith("Token: ") and len(text.removeprefix("Token: ").strip()) < 12:
+            return None
+
+    if ftype == "PHPINFO_EXPOSURE":
+        if text.startswith("phpinfo indicator:"):
+            return None
+
+    return text
 
 
 def _compact_trigger(trigger: Dict[str, Any]) -> Dict[str, Any]:
@@ -222,17 +252,29 @@ def _refined_llm_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _best_exposed_information(finding: Dict[str, Any]) -> List[str]:
-    explicit = _dedup_str_list(
+    explicit_raw = _dedup_str_list(
         finding.get("missing_security_controls")
+        or finding.get("normalized_exposed_information")
         or finding.get("exposed_information")
         or [],
+        limit=6,
+    )
+    explicit = _dedup_str_list(
+        [_sanitize_exposed_item(finding, item) for item in explicit_raw if _sanitize_exposed_item(finding, item)],
         limit=6,
     )
     if explicit:
         return explicit
 
     refined = _refined_llm_finding(finding)
-    refined_items = _dedup_str_list(refined.get("exposed_information") or [], limit=6)
+    refined_items = _dedup_str_list(
+        [
+            _sanitize_exposed_item(finding, item)
+            for item in (refined.get("exposed_information") or [])
+            if _sanitize_exposed_item(finding, item)
+        ],
+        limit=6,
+    )
     if refined_items:
         return refined_items
 
@@ -596,6 +638,9 @@ def serialize_compact_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
         "trigger_count": finding.get("trigger_count") or len(finding.get("events") or []),
         "primary_evidence": primary_evidence,
         "exposed_information": exposed_information,
+        "normalized_exposed_information": _dedup_str_list(finding.get("normalized_exposed_information") or [], limit=6),
+        "exposed_information_raw": _dedup_str_list(finding.get("exposed_information_raw") or [], limit=8),
+        "llm_evidence_review": finding.get("llm_evidence_review"),
         "severity_reason": severity_reason,
         "recommendation": recommendations,
         "technology_fingerprint": technology_fingerprint,
@@ -675,4 +720,3 @@ def serialize_debug_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
         debug_finding["evidence"] = evidence
 
     return debug_finding
-

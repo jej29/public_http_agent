@@ -512,6 +512,14 @@ def merge_finding(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, An
             (existing.get("exposed_information_raw") or []) + (new.get("exposed_information_raw") or [])
         )[:8]
 
+    if new.get("normalized_exposed_information"):
+        existing["normalized_exposed_information"] = _dedup_str_list(
+            (existing.get("normalized_exposed_information") or []) + (new.get("normalized_exposed_information") or [])
+        )[:8]
+
+    if new.get("llm_evidence_review"):
+        existing["llm_evidence_review"] = new.get("llm_evidence_review")
+
     existing["normalized_url"] = normalize_url_for_dedup(canonical_finding_url(existing))
     existing["trigger_count"] = len(existing.get("events", []))
     existing["triggers"] = [ev.get("trigger") for ev in existing.get("events", []) if ev.get("trigger")][:max_events]

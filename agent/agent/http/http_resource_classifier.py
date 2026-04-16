@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import re
 from typing import Any, Dict, List
 from urllib.parse import urlsplit
@@ -399,10 +400,27 @@ def _format_config_exposed_information(
     exposed_information: List[str] = []
     classified = extracted_summary.get("classified") or {}
 
+    def _clean_value(value: str) -> str:
+        text = html.unescape(str(value or "")).replace("\ufffd", "").strip()
+        return re.sub(r"\s+", " ", text)
+
+    def _is_meaningful_value(value: str) -> bool:
+        text = _clean_value(value)
+        if not text:
+            return False
+        if text.lower() in {"array (", "array(", "{}", "[]", "null", "none"}:
+            return False
+        if len(text) < 4:
+            return False
+        if text.count("*") >= max(4, len(text) // 2):
+            return False
+        return True
+
     def _first_value(key_class: str) -> str | None:
         for row in classified.get(key_class) or []:
-            if not row.get("masked") and row.get("value"):
-                return str(row["value"])
+            value = _clean_value(row.get("value") or "")
+            if not row.get("masked") and _is_meaningful_value(value):
+                return value
         return None
 
     mapping = [
@@ -423,6 +441,8 @@ def _format_config_exposed_information(
     for key_class, template in mapping:
         value = _first_value(key_class)
         if value:
+            if key_class == "token" and len(value) < 12:
+                continue
             exposed_information.append(template.format(value=value))
 
     if _first_value("private_key"):
@@ -430,12 +450,6 @@ def _format_config_exposed_information(
 
     if exposed_information:
         return _dedup(exposed_information)[:6]
-
-    masked_rows = extracted_summary.get("masked_values") or []
-    if masked_rows:
-        masked_key_classes = sorted({str(item.get("key_class") or "generic") for item in masked_rows})
-        for key_class in masked_key_classes[:4]:
-            exposed_information.append(f"Masked configuration value present: {key_class}")
 
     if not exposed_information:
         if "db_password" in markers or "mysql_password" in markers:
@@ -452,9 +466,6 @@ def _format_config_exposed_information(
             exposed_information.append("Sensitive secret material disclosed")
         if "connection_string" in markers:
             exposed_information.append("Connection string disclosed")
-
-    if not exposed_information:
-        exposed_information.append("Application configuration details disclosed")
 
     return _dedup(exposed_information)[:6]
 
@@ -681,10 +692,27 @@ def _build_phpinfo_signal(
     has_phpinfo_table_shape = "<table" in body_l and (
         "php credits" in body_l or "php core" in body_l or "apache2handler" in body_l
     )
+    document_like = any(
+        token in body_l
+        for token in (
+            "installation",
+            "instructions",
+            "readme",
+            "license",
+            "copying",
+            "download",
+            "docker",
+            "virtualbox",
+            "vmware",
+            "github",
+        )
+    )
+    if document_like and not route_hint:
+        return []
 
     concrete_phpinfo = (
-        len(indicators) >= 2
-        or strong_hit_count >= 2
+        ("<title>phpinfo()</title>" in body_l)
+        or (route_hint and len(indicators) >= 2)
         or (route_hint and strong_hit_count >= 1 and weak_hit_count >= 2)
         or (route_hint and has_phpinfo_table_shape)
     )
@@ -692,8 +720,28 @@ def _build_phpinfo_signal(
         return []
 
     exposed_information = ["PHP runtime and environment details exposed"]
+    for item in (feats.get("strong_version_tokens_in_body") or [])[:4]:
+        token = str(item).strip()
+        if not token:
+            continue
+        if token.lower().startswith("php/"):
+            exposed_information.append(f"PHP version: {token}")
+        else:
+            exposed_information.append(f"Server software: {token}")
     for item in indicators[:4]:
-        exposed_information.append(f"phpinfo indicator: {item}")
+        normalized = str(item).strip().lower()
+        if normalized in {"php version", "phpinfo()"}:
+            continue
+        if normalized == "loaded modules":
+            exposed_information.append("Loaded PHP modules listed")
+        elif normalized == "server api":
+            exposed_information.append("Server API listed")
+        elif normalized == "php variables":
+            exposed_information.append("PHP variables listed")
+        elif normalized == "configuration file":
+            exposed_information.append("PHP configuration file path listed")
+        else:
+            exposed_information.append(f"phpinfo indicator: {item}")
     if "php version" in body_l:
         exposed_information.append("PHP version disclosed")
     if "loaded modules" in body_l:
@@ -829,7 +877,6 @@ def _build_config_exposure_signal(
         "access_key",
         "secret",
         "client_secret",
-        "token",
         "private_key",
         "redis_password",
     }
@@ -838,6 +885,11 @@ def _build_config_exposure_signal(
     has_real_secret = bool(real_key_classes.intersection(strong_secret_classes))
     has_real_db_context = bool(real_key_classes.intersection(db_context_classes))
     distinct_db_context_count = len(real_key_classes.intersection(db_context_classes))
+    token_only_values = bool(real_key_classes) and real_key_classes.issubset({"token"})
+    only_generic_or_token_values = bool(real_key_classes) and not (
+        real_key_classes.intersection(db_context_classes)
+        or real_key_classes.intersection(strong_secret_classes)
+    )
     setup_like_path = any(token in path_l for token in ("setup", "install", "installer"))
     html_db_setup_exposure = (
         distinct_db_context_count >= 3
@@ -858,24 +910,43 @@ def _build_config_exposure_signal(
     masked_db_context_count = len(masked_key_classes.intersection(db_context_classes))
 
     allow_config_exposure = (
-        has_real_secret
+        php_config_assignment_count >= 3
         or html_db_setup_exposure
-        or len(real_values) >= 3
-        or php_config_assignment_count >= 3
-        or (has_real_db_context and len(real_values) >= 2)
         or (
             path_is_config_like
-            and config_like_body_kind
             and (
-                len(real_values) >= 2
+                distinct_db_context_count >= 3
+                or masked_db_context_count >= 3
+                or has_real_secret
+            )
+        )
+        or (
+            config_like_body_kind
+            and (
+                distinct_db_context_count >= 3
+                or (has_real_secret and has_real_db_context)
                 or masked_db_context_count >= 3
             )
         )
+        or (
+            has_real_secret
+            and (
+                path_is_config_like
+                or config_like_body_kind
+                or distinct_db_context_count >= 2
+            )
+        )
     )
+    if only_generic_or_token_values and not path_is_config_like and php_config_assignment_count < 3:
+        allow_config_exposure = False
+    if token_only_values and not path_is_config_like and distinct_db_context_count == 0:
+        allow_config_exposure = False
     if not allow_config_exposure:
         return []
 
     exposed_information = _format_config_exposed_information(extracted_summary, markers)
+    if not exposed_information:
+        return []
     severity = "High" if has_real_secret or len(real_values) >= 3 or html_db_setup_exposure or php_config_assignment_count >= 3 else "Medium"
     confidence = 0.94 if severity == "High" else 0.86
 

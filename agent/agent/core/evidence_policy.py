@@ -99,7 +99,22 @@ def has_strong_file_path_evidence(candidate: Dict[str, Any]) -> bool:
 
 def has_strong_error_disclosure(candidate: Dict[str, Any]) -> bool:
     evidence = evidence_dict(candidate)
-    if evidence.get("stack_traces") or evidence.get("db_errors") or evidence.get("file_paths"):
+    stack_traces = [
+        str(x).strip()
+        for x in (evidence.get("stack_traces") or [])
+        if str(x).strip()
+        and str(x).strip().lower() not in {"fatal error", "stack trace", "exception", "traceback", "stack trace: fatal error"}
+        and any(marker in str(x).lower() for marker in (" in /", " on line ", "traceback", "caused by:", "#0 ", "stack trace:"))
+    ]
+    db_errors = [
+        str(x).strip()
+        for x in (evidence.get("db_errors") or [])
+        if str(x).strip()
+        and len(str(x).strip()) >= 18
+        and str(x).strip().lower() not in {"sqlite3.", "sqlite3", "mysql", "postgres", "oracle"}
+        and not any(tok in str(x).lower() for tok in ("<span", "</span>", "color:", "&lt;span"))
+    ]
+    if stack_traces or db_errors or evidence.get("file_paths"):
         return True
     return evidence.get("error_exposure_class") == "debug_error_page" and len(evidence.get("debug_hints") or []) >= 2
 
