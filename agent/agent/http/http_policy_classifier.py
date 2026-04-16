@@ -43,6 +43,14 @@ def _is_static_response(feats: Dict[str, Any]) -> bool:
     return (feats.get("response_kind") or "") == "static_asset"
 
 
+def _is_auth_or_session_loss(feats: Dict[str, Any]) -> bool:
+    return bool(
+        feats.get("auth_required_like")
+        or feats.get("session_expired_like")
+        or feats.get("external_auth_redirect_like")
+    )
+
+
 def _is_baseline_probe(request_meta: Dict[str, Any]) -> bool:
     name = str(request_meta.get("name") or "").lower()
     family = str(request_meta.get("family") or "")
@@ -181,6 +189,8 @@ def _build_header_policy_signals(
     if req_method not in {"GET", "HEAD"} or code is None or code >= 400:
         return []
     if _is_static_response(feats) or req_family in {"cors_behavior", "method_behavior", "body_behavior"}:
+        return []
+    if _is_auth_or_session_loss(feats):
         return []
 
     requested_url = str(request_meta.get("url") or "")
@@ -375,6 +385,8 @@ def _build_method_signals(request_meta: Dict[str, Any], response_kind: str, fina
     requested_url = str(request_meta.get("url") or "")
     if _is_external_auth_transition(requested_url, final_url):
         return out
+    if _is_auth_or_session_loss(feats):
+        return out
 
     if feats.get("trace_reflection"):
         out.append(build_signal(
@@ -408,6 +420,8 @@ def _build_method_signals(request_meta: Dict[str, Any], response_kind: str, fina
 def _build_transport_signals(request_meta: Dict[str, Any], snapshot: Dict[str, Any], feats: Dict[str, Any], response_kind: str, final_url: str, technology_fingerprint: List[str]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     requested_url = str(request_meta.get("url") or "")
+    if _is_auth_or_session_loss(feats):
+        return out
     requested_scheme = urlsplit(requested_url).scheme.lower()
     final_scheme = urlsplit(final_url).scheme.lower()
     code = _status_code(snapshot, feats)

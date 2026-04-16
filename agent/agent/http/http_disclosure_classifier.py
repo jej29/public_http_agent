@@ -150,6 +150,14 @@ def _is_static_response(feats: Dict[str, Any]) -> bool:
     return (feats.get("response_kind") or "") == "static_asset"
 
 
+def _is_auth_or_session_loss(feats: Dict[str, Any]) -> bool:
+    return bool(
+        feats.get("auth_required_like")
+        or feats.get("session_expired_like")
+        or feats.get("external_auth_redirect_like")
+    )
+
+
 def _requested_and_final_origin(
     requested_url: str,
     final_url: str,
@@ -232,6 +240,8 @@ def should_skip_info_disclosure(
         return True
     if _is_external_auth_transition(requested_url, final_url):
         return True
+    if _is_auth_or_session_loss(feats):
+        return True
 
     has_strong_error_like_signal = bool(
         feats.get("error_exposure_class")
@@ -264,9 +274,15 @@ def _build_error_disclosure_signals(
     stack_traces = _meaningful_stack_traces(feats.get("stack_traces") or [])
     file_paths = _meaningful_file_paths(feats.get("file_paths") or [])
     db_errors = _meaningful_db_errors(feats.get("db_errors") or [])
+    phpinfo_indicators = _dedup(feats.get("phpinfo_indicators") or [])
+    phpinfo_extracted_values = feats.get("phpinfo_extracted_values") or []
     debug_hints = _dedup(feats.get("debug_hints") or [])
     default_error_hint = str(feats.get("default_error_hint") or "")
     template_fingerprint = str(feats.get("error_template_fingerprint") or "")
+
+    looks_like_phpinfo_page = bool(phpinfo_extracted_values) or len(phpinfo_indicators) >= 2
+    if looks_like_phpinfo_page and file_paths and not stack_traces and not db_errors:
+        return []
 
     exposed_information: List[str] = []
     exposed_information.extend([f"Stack trace: {_clean_disclosure_text(item)}" for item in stack_traces[:2]])
@@ -402,6 +418,8 @@ def _build_non_error_body_disclosure_signals(
         return []
     if _is_auth_redirect(snapshot) or _is_static_response(feats):
         return []
+    if _is_auth_or_session_loss(feats):
+        return []
     if _looks_like_generic_notfound_template(snapshot, feats):
         return []
 
@@ -466,6 +484,8 @@ def build_file_path_handling_signal(
     if not fileish_params:
         return []
     if _is_external_auth_transition(str(request_meta.get("url") or ""), final_url):
+        return []
+    if _is_auth_or_session_loss(feats):
         return []
     if looks_like_setup_or_install_page(final_url, body_text):
         return []

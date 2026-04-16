@@ -44,7 +44,7 @@ def _apply_final_verdict_state(candidate: Dict[str, Any]) -> Dict[str, Any]:
     raw_items = candidate.get("exposed_information_raw")
     if not isinstance(raw_items, list) or not raw_items:
         raw_items = list(candidate.get("exposed_information") or [])
-    candidate["exposed_information_raw"] = [str(x).strip() for x in raw_items if str(x).strip()][:8]
+    candidate["exposed_information_raw"] = [str(x).strip() for x in raw_items if str(x).strip()][:16]
 
     try:
         reviewed = normalize_exposure_with_llm(
@@ -54,7 +54,7 @@ def _apply_final_verdict_state(candidate: Dict[str, Any]) -> Dict[str, Any]:
         )
     except Exception:
         reviewed = {
-            "exposed_information_normalized": candidate["exposed_information_raw"][:5],
+            "exposed_information_normalized": candidate["exposed_information_raw"][:10],
             "severity_reason": [],
             "evidence_review": {"mode": "fallback_error"},
         }
@@ -63,10 +63,12 @@ def _apply_final_verdict_state(candidate: Dict[str, Any]) -> Dict[str, Any]:
         str(x).strip()
         for x in (reviewed.get("exposed_information_normalized") or [])
         if str(x).strip()
-    ][:6]
+    ][:10]
     if normalized_items:
+        candidate["exposed_information"] = normalized_items
         candidate["normalized_exposed_information"] = normalized_items
     else:
+        candidate["exposed_information"] = candidate["exposed_information_raw"][:10]
         candidate.pop("normalized_exposed_information", None)
 
     review_meta = reviewed.get("evidence_review")

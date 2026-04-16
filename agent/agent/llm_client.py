@@ -856,7 +856,7 @@ def normalize_exposure_with_llm(
                 kept.append(text)
 
         return {
-            "exposed_information_normalized": _dedup_str_list(kept, limit=5),
+            "exposed_information_normalized": _dedup_str_list(kept, limit=10),
             "severity_reason": [],
             "evidence_review": {
                 "mode": "heuristic_fallback",
@@ -935,12 +935,12 @@ Return ONLY JSON:
             severity_reason = []
 
         return {
-            "exposed_information_normalized": [str(x).strip() for x in normalized if str(x).strip()][:5],
-            "severity_reason": [str(x).strip() for x in severity_reason if str(x).strip()][:5],
+            "exposed_information_normalized": [str(x).strip() for x in normalized if str(x).strip()][:10],
+            "severity_reason": [str(x).strip() for x in severity_reason if str(x).strip()][:6],
             "evidence_review": {
                 "mode": "llm",
-                "kept_count": len([str(x).strip() for x in normalized if str(x).strip()][:5]),
-                "dropped_count": max(0, len(raw_exposed_information or []) - len([str(x).strip() for x in normalized if str(x).strip()][:5])),
+                "kept_count": len([str(x).strip() for x in normalized if str(x).strip()][:10]),
+                "dropped_count": max(0, len(raw_exposed_information or []) - len([str(x).strip() for x in normalized if str(x).strip()][:10])),
             },
         }
     except Exception:

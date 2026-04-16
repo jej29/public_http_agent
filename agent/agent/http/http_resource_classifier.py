@@ -74,6 +74,14 @@ def _is_static_response(feats: Dict[str, Any]) -> bool:
     return (feats.get("response_kind") or "") == "static_asset"
 
 
+def _is_auth_or_session_loss(feats: Dict[str, Any]) -> bool:
+    return bool(
+        feats.get("auth_required_like")
+        or feats.get("session_expired_like")
+        or feats.get("external_auth_redirect_like")
+    )
+
+
 def _requested_and_final_origin(
     requested_url: str,
     final_url: str,
@@ -173,6 +181,8 @@ def _resource_exposure_is_confirmable(snapshot: Dict[str, Any], feats: Dict[str,
         return False
     if _is_auth_redirect(snapshot):
         return False
+    if _is_auth_or_session_loss(feats):
+        return False
     if status_code != 200:
         return False
     if response_kind == "other" and body_len == 0:
@@ -210,6 +220,8 @@ def _default_resource_has_concrete_marker(
     if _is_same_error_page_for_resource_probe(snapshot, feats):
         return False
     if _looks_like_generic_notfound_template(snapshot, feats):
+        return False
+    if _is_auth_or_session_loss(feats):
         return False
 
     if subtype == "phpinfo_page":
@@ -652,6 +664,8 @@ def _build_phpinfo_signal(
         return []
     if _is_auth_redirect(snapshot):
         return []
+    if _is_auth_or_session_loss(feats):
+        return []
     if _is_static_response(feats):
         return []
     if _looks_like_generic_notfound_template(snapshot, feats):
@@ -719,7 +733,12 @@ def _build_phpinfo_signal(
     if not concrete_phpinfo:
         return []
 
-    exposed_information = ["PHP runtime and environment details exposed"]
+    phpinfo_extracted_values = feats.get("phpinfo_extracted_values") or []
+    exposed_information: List[str] = []
+    for item in phpinfo_extracted_values[:10]:
+        display = str(item.get("display") or "").strip()
+        if display:
+            exposed_information.append(display)
     for item in (feats.get("strong_version_tokens_in_body") or [])[:4]:
         token = str(item).strip()
         if not token:
@@ -742,6 +761,8 @@ def _build_phpinfo_signal(
             exposed_information.append("PHP configuration file path listed")
         else:
             exposed_information.append(f"phpinfo indicator: {item}")
+    if not exposed_information:
+        exposed_information.append("PHP runtime and environment details exposed")
     if "php version" in body_l:
         exposed_information.append("PHP version disclosed")
     if "loaded modules" in body_l:
@@ -750,7 +771,6 @@ def _build_phpinfo_signal(
         exposed_information.append("PHP server API disclosed")
     if "configuration file" in body_l or "include_path" in body_l:
         exposed_information.append("PHP configuration details disclosed")
-
     technology_fingerprint = feats.get("technology_fingerprint") or []
     return [
         _build_signal(
@@ -773,8 +793,9 @@ def _build_phpinfo_signal(
                 "has_phpinfo_table_shape": has_phpinfo_table_shape,
                 "technology_fingerprint": technology_fingerprint,
                 "strong_version_tokens_in_body": feats.get("strong_version_tokens_in_body") or [],
+                "phpinfo_extracted_values": phpinfo_extracted_values,
             },
-            exposed_information=_dedup(exposed_information)[:6],
+            exposed_information=_dedup(exposed_information)[:12],
             leak_type="phpinfo_page",
             leak_value=final_url,
             cwe="CWE-200",
@@ -1016,6 +1037,8 @@ def _build_log_exposure_signal(
     if _resource_probe_is_actually_error_disclosure(feats):
         return []
     if _looks_like_generic_notfound_template(snapshot, feats):
+        return []
+    if _is_auth_or_session_loss(feats):
         return []
     if _is_external_auth_transition(requested_url, final_url):
         return []

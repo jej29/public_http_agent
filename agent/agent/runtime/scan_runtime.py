@@ -1359,7 +1359,7 @@ async def llm_judge_if_enabled(candidate: Dict[str, Any], snapshot: Dict[str, An
 
         if sanitized_exposed is not None:
             candidate["exposed_information_raw"] = raw_exposed
-            candidate["exposed_information"] = sanitized_exposed[:4]
+            candidate["exposed_information"] = sanitized_exposed[:10]
             candidate["severity_reason"] = []
 
         elif isinstance(raw_exposed, list) and raw_exposed:
@@ -1380,7 +1380,7 @@ async def llm_judge_if_enabled(candidate: Dict[str, Any], snapshot: Dict[str, An
                     if isinstance(normalized_items, list) and normalized_items:
                         candidate["exposed_information"] = [
                             str(x).strip() for x in normalized_items if str(x).strip()
-                        ][:4]
+                        ][:10]
                     else:
                         candidate["exposed_information"] = original_exposed
 

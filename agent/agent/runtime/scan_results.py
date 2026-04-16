@@ -152,6 +152,12 @@ def finalize_and_write_results(
 
     results["metadata"]["finished_at"] = now_utc_iso_fn()
     results["metadata"]["request_count"] = len(raw_index)
+    auth_state_loss_events = [
+        item for item in request_failures
+        if str(item.get("error_class") or "") == "AuthStateLoss"
+    ]
+    results["metadata"]["auth_state_loss_count"] = len(auth_state_loss_events)
+    results["metadata"]["auth_state_loss_examples"] = auth_state_loss_events[:10]
     results["metadata"]["discovered_endpoint_count_before_pruning"] = original_discovered_count
     results["metadata"]["discovered_endpoint_count"] = len(discovered_endpoints)
     results["metadata"]["max_endpoints"] = max_endpoints

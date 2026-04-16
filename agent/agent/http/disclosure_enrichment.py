@@ -296,6 +296,7 @@ def build_detector_disclosure_signals(
     final_url = str(feats.get("final_url") or snapshot.get("final_url") or requested_url)
     status_code = feats.get("status_code") or snapshot.get("status_code")
     setup_or_install_page = _looks_like_setup_or_install_page(final_url, body)
+    looks_like_phpinfo_page = bool(feats.get("phpinfo_extracted_values") or []) or len(feats.get("phpinfo_indicators") or []) >= 2
 
     if not body and not headers:
         return []
@@ -369,7 +370,7 @@ def build_detector_disclosure_signals(
             continue
 
         if signal.disclosure_type == DisclosureType.FILE_PATH:
-            if setup_or_install_page:
+            if setup_or_install_page or looks_like_phpinfo_page:
                 continue
             evidence["file_paths"] = _dedup(signal.evidence)
             out.append(

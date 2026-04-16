@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import posixpath
 import re
 from typing import Any, Dict, List
@@ -198,6 +199,60 @@ HTML_LABEL_VALUE_REGEXES = [
     ),
 ]
 
+PHPINFO_ROW_REGEX = re.compile(
+    r'(?is)<tr[^>]*>\s*<td[^>]*class=["\']e["\'][^>]*>\s*(.*?)\s*</td>\s*<td[^>]*class=["\']v["\'][^>]*>\s*(.*?)\s*</td>'
+)
+PHPINFO_VARIABLE_REGEX = re.compile(
+    r"^\$_(?P<scope>ENV|SERVER|COOKIE|REQUEST)\[['\"](?P<name>[^'\"]+)['\"]\]$",
+    re.I,
+)
+PHPINFO_INTERESTING_LABELS = {
+    "system",
+    "build system",
+    "build provider",
+    "server api",
+    "configuration file (php.ini) path",
+    "loaded configuration file",
+    "scan this dir for additional .ini files",
+    "additional .ini files parsed",
+    "server root",
+    "loaded modules",
+    "hostname:port",
+    "server administrator",
+    "apache version",
+    "document root",
+    "include_path",
+    "open_basedir",
+    "extension_dir",
+}
+PHPINFO_INTERESTING_SERVER_VARS = {
+    "server_software",
+    "server_signature",
+    "server_addr",
+    "remote_addr",
+    "document_root",
+    "context_document_root",
+    "script_filename",
+    "php_self",
+    "request_uri",
+    "http_cookie",
+    "http_authorization",
+}
+PHPINFO_INTERESTING_ENV_VARS = {
+    "db_server",
+    "db_database",
+    "db_user",
+    "db_password",
+    "db_port",
+    "php_ini_dir",
+    "pwd",
+    "path",
+}
+PHPINFO_SECRET_ENV_PATTERNS = [
+    re.compile(r"(?i)(?:^|_)(?:db|database|redis|mysql|postgres|pg|mongo|amqp|ldap)_(?:host|name|user|username|password|pass|port)$"),
+    re.compile(r"(?i)(?:secret|token|api_key|private_key|access_key|connection_string|dsn)$"),
+]
+
 
 def _is_masked_value(value: str) -> bool:
     v = value.strip().lower()
@@ -307,6 +362,233 @@ def _extract_config_values(body: str) -> List[Dict[str, Any]]:
         out.append(f)
 
     return out[:20]
+
+
+def _clean_phpinfo_cell(raw: str) -> str:
+    value = html.unescape(str(raw or ""))
+    value = re.sub(r"(?is)<br\s*/?>", "\n", value)
+    value = re.sub(r"(?is)<[^>]+>", " ", value)
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"\r", "", value)
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip(" \n\t:")
+
+
+def _phpinfo_value_is_meaningful(key: str, value: str) -> bool:
+    if not key or not value:
+        return False
+    value_l = value.lower()
+    if value_l in {"no value", "none", "off", "disabled", "0", "(none)"}:
+        return False
+    if len(value) < 3:
+        return False
+    return True
+
+
+def _format_phpinfo_entry(label: str, value: str) -> str:
+    return f"{label}: {value}"
+
+
+def _extract_phpinfo_values(body: str) -> List[Dict[str, str]]:
+    if not body:
+        return []
+
+    findings: List[Dict[str, str]] = []
+    for raw_label, raw_value in PHPINFO_ROW_REGEX.findall(body):
+        label = _clean_phpinfo_cell(raw_label)
+        value = _clean_phpinfo_cell(raw_value)
+        if not _phpinfo_value_is_meaningful(label, value):
+            continue
+
+        label_l = label.lower()
+        variable_match = PHPINFO_VARIABLE_REGEX.match(label)
+        if variable_match:
+            scope = variable_match.group("scope").upper()
+            variable_name = variable_match.group("name").strip()
+            variable_name_l = variable_name.lower()
+
+            keep_variable = False
+            if scope == "SERVER" and variable_name_l in PHPINFO_INTERESTING_SERVER_VARS:
+                keep_variable = True
+            elif scope in {"COOKIE", "REQUEST"} and any(
+                token in variable_name_l for token in ("phpsessid", "session", "token", "auth", "jwt", "csrf")
+            ):
+                keep_variable = True
+            elif scope == "ENV":
+                keep_variable = (
+                    variable_name_l in PHPINFO_INTERESTING_ENV_VARS
+                    or any(regex.search(variable_name) for regex in PHPINFO_SECRET_ENV_PATTERNS)
+                )
+
+            if not keep_variable:
+                continue
+
+            findings.append(
+                {
+                    "category": f"phpinfo_{scope.lower()}",
+                    "key": variable_name,
+                    "label": label,
+                    "value": value,
+                    "display": _format_phpinfo_entry(variable_name, value),
+                }
+            )
+            continue
+
+        if label_l in PHPINFO_INTERESTING_LABELS:
+            findings.append(
+                {
+                    "category": "phpinfo_label",
+                    "key": label_l,
+                    "label": label,
+                    "value": value,
+                    "display": _format_phpinfo_entry(label, value),
+                }
+            )
+            continue
+
+    seen = set()
+    out: List[Dict[str, str]] = []
+    for item in findings:
+        sig = (item["category"], item["key"], item["value"])
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(item)
+
+    priority = {
+        "loaded configuration file": 0,
+        "configuration file (php.ini) path": 1,
+        "scan this dir for additional .ini files": 2,
+        "additional .ini files parsed": 3,
+        "document root": 4,
+        "script_filename": 5,
+        "server_software": 6,
+        "server_addr": 7,
+        "remote_addr": 8,
+        "db_server": 9,
+        "db_database": 10,
+        "db_user": 11,
+        "db_password": 12,
+        "http_cookie": 13,
+        "phpsessid": 14,
+    }
+    out.sort(key=lambda item: (priority.get(item["key"].lower(), 100), item["label"].lower()))
+    return out[:20]
+
+
+def _is_external_auth_transition_url(requested_url: str, final_url: str) -> bool:
+    requested_parts = urlsplit(str(requested_url or ""))
+    final_parts = urlsplit(str(final_url or requested_url or ""))
+    requested_origin = (requested_parts.scheme.lower(), requested_parts.netloc.lower())
+    final_origin = (final_parts.scheme.lower(), final_parts.netloc.lower())
+    if not requested_origin[1] or not final_origin[1]:
+        return False
+    if requested_origin == final_origin:
+        return False
+    final_url_l = str(final_url or "").lower()
+    return any(token in final_url_l for token in ("login", "signin", "sign-in", "/auth", "/sso", "adfs", "oauth", "saml"))
+
+
+def _looks_like_auth_required_response(
+    *,
+    status_code: int | None,
+    final_url: str,
+    body_lower: str,
+    login_like: bool,
+) -> bool:
+    if status_code in {401, 403, 407}:
+        return True
+    final_url_l = str(final_url or "").lower()
+    if any(token in final_url_l for token in ("/login", "/signin", "/sign-in", "login.php", "/auth", "/sso", "adfs", "oauth", "saml")):
+        return True
+    auth_required_markers = (
+        "please log in",
+        "please sign in",
+        "authentication required",
+        "authorization required",
+        "access denied",
+        "unauthorized",
+        "forbidden",
+        "single sign-on",
+        "sso login",
+        "identity provider",
+        "federated login",
+    )
+    if any(marker in body_lower for marker in auth_required_markers):
+        return True
+    return login_like
+
+
+def _looks_like_session_expired_response(body_lower: str, final_url: str) -> bool:
+    markers = (
+        "session expired",
+        "your session has expired",
+        "session timeout",
+        "logged out",
+        "please re-authenticate",
+        "please authenticate again",
+        "reauthenticate",
+        "re-authenticate",
+        "login again",
+    )
+    if any(marker in body_lower for marker in markers):
+        return True
+    final_url_l = str(final_url or "").lower()
+    return any(token in final_url_l for token in ("sessionexpired", "session-expired", "timeout", "reauth"))
+
+
+def _looks_like_login_or_auth_page(body_lower: str, final_url: str) -> bool:
+    final_url_l = str(final_url or "").lower()
+    if any(tok in final_url_l for tok in ("/login", "/signin", "/sign-in", "/auth", "/sso", "adfs", "oauth", "saml")):
+        return True
+
+    if "<title>php" in body_lower and "phpinfo()" in body_lower:
+        return False
+
+    auth_heading_markers = (
+        "please log in",
+        "please sign in",
+        "sign in",
+        "log in",
+        "login",
+        "single sign-on",
+        "identity provider",
+        "authentication required",
+        "federated login",
+    )
+    auth_ui_markers = (
+        "remember me",
+        "forgot password",
+        "forgot your password",
+        "continue with",
+        "login with",
+    )
+    has_password_input = any(tok in body_lower for tok in (
+        'type="password"',
+        "type='password'",
+        'name="password"',
+        "name='password'",
+        'id="password"',
+        "id='password'",
+    ))
+    has_form = "<form" in body_lower
+    has_identity_field = any(tok in body_lower for tok in (
+        'name="username"',
+        "name='username'",
+        'name="email"',
+        "name='email'",
+        'type="email"',
+        "type='email'",
+    ))
+    has_auth_heading = any(tok in body_lower for tok in auth_heading_markers)
+    has_auth_ui = any(tok in body_lower for tok in auth_ui_markers)
+
+    if has_auth_heading and (has_password_input or has_form or has_auth_ui):
+        return True
+    if has_form and has_password_input and (has_identity_field or has_auth_heading):
+        return True
+    return False
 
 
 LOG_EXPOSURE_PATTERNS = [
@@ -1363,6 +1645,7 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
     )
 
     phpinfo_indicators = _detect_phpinfo_indicators(body)
+    phpinfo_extracted_values = _extract_phpinfo_values(body)
     config_exposure_markers = _detect_config_exposure_markers(body)
     log_exposure_patterns = _detect_log_exposure_patterns(body)
     config_extracted_values = _extract_config_values(body)
@@ -1465,20 +1748,15 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
     spa_shell_hit_count = sum(1 for marker in spa_shell_markers if marker in body_l)
     looks_like_spa_shell = spa_shell_hit_count >= 5
 
-    login_like = any(
-        tok in body_l
-        for tok in (
-            "login",
-            "log in",
-            "sign in",
-            "signin",
-            "username",
-            "password",
-            "remember me",
-            "forgot password",
-            "authentication required",
-        )
-    ) or any(tok in final_url.lower() for tok in ("/login", "/signin", "/auth", "/sso"))
+    login_like = _looks_like_login_or_auth_page(body_l, final_url)
+    auth_required_like = _looks_like_auth_required_response(
+        status_code=status_code,
+        final_url=final_url,
+        body_lower=body_l,
+        login_like=login_like,
+    )
+    session_expired_like = _looks_like_session_expired_response(body_l, final_url)
+    external_auth_redirect_like = _is_external_auth_transition_url(requested_url, final_url)
 
     generic_notfound_like = False
     generic_markers = [
@@ -1514,6 +1792,9 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
         "is_probable_documentation": document_like,
         "is_probable_spa_shell": looks_like_spa_shell,
         "is_login_like": login_like,
+        "is_auth_required_like": auth_required_like,
+        "is_session_expired_like": session_expired_like,
+        "is_external_auth_redirect_like": external_auth_redirect_like,
         "is_generic_notfound_template": generic_notfound_like,
         "is_public_download_like": public_download_like,
         "is_low_signal_body": low_signal_body,
@@ -1614,6 +1895,12 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
         reasons.append("spa_shell_like")
     if login_like:
         reasons.append("login_like")
+    if auth_required_like:
+        reasons.append("auth_required_like")
+    if session_expired_like:
+        reasons.append("session_expired_like")
+    if external_auth_redirect_like:
+        reasons.append("external_auth_redirect_like")
     if generic_notfound_like:
         reasons.append("generic_notfound_like")
 
@@ -1666,6 +1953,7 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
         "directory_listing_hints": directory_listing_hints,
         "default_file_hints": default_file_hints,
         "phpinfo_indicators": phpinfo_indicators,
+        "phpinfo_extracted_values": phpinfo_extracted_values,
         "config_exposure_markers": config_exposure_markers,
         "log_exposure_patterns": log_exposure_patterns,
         "config_extracted_values": config_extracted_values,
@@ -1686,6 +1974,9 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
         "response_cookie_names": response_cookie_names,
         "request_sensitive_cookie_names_missing_in_response": request_sensitive_cookie_names_missing_in_response,
         "cors": cors,
+        "auth_required_like": auth_required_like,
+        "session_expired_like": session_expired_like,
+        "external_auth_redirect_like": external_auth_redirect_like,
 
         "https_redirect_missing": https_redirect_missing,
         "hsts_missing": hsts_missing,

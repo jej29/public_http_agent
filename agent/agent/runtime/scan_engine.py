@@ -1718,6 +1718,9 @@ async def process_plan(
             "baseline_successes": 0,
             "baseline_unhealthy": False,
             "baseline_failure_examples": [],
+            "auth_failure_count": 0,
+            "auth_unhealthy": False,
+            "auth_failure_examples": [],
         }
 
     def _effective_auth_state(spec: Any) -> str:
@@ -1898,6 +1901,81 @@ async def process_plan(
             and not bool(snap.get("headers_received"))
         )
 
+    def _response_indicates_auth_loss(
+        *,
+        feats: Dict[str, Any],
+        auth_state: str,
+    ) -> bool:
+        if str(auth_state or "").strip().lower() != "authenticated":
+            return False
+        return bool(
+            feats.get("auth_required_like")
+            or feats.get("session_expired_like")
+            or feats.get("external_auth_redirect_like")
+        )
+
+    def _update_scope_auth_health(
+        *,
+        scope_state: Dict[str, Any],
+        scope_key: str,
+        spec: Any,
+        feats: Dict[str, Any],
+        auth_state: str,
+        raw_path: str,
+    ) -> None:
+        if not _response_indicates_auth_loss(feats=feats, auth_state=auth_state):
+            return
+
+        scope_state["auth_failure_count"] = int(scope_state.get("auth_failure_count", 0)) + 1
+        examples = scope_state.setdefault("auth_failure_examples", [])
+        if len(examples) < 5:
+            examples.append(
+                {
+                    "name": str(getattr(spec, "name", "") or ""),
+                    "method": str(getattr(spec, "method", "") or "").upper(),
+                    "url": str(getattr(spec, "url", "") or ""),
+                    "final_url": str(feats.get("final_url") or ""),
+                    "status_code": feats.get("status_code"),
+                    "auth_required_like": bool(feats.get("auth_required_like")),
+                    "session_expired_like": bool(feats.get("session_expired_like")),
+                    "external_auth_redirect_like": bool(feats.get("external_auth_redirect_like")),
+                    "raw_ref": raw_path,
+                }
+            )
+
+        if not scope_state.get("auth_unhealthy") and int(scope_state.get("auth_failure_count", 0)) >= 1:
+            scope_state["auth_unhealthy"] = True
+            unhealthy_scopes.add(scope_key)
+            log_fn(
+                "AUTH",
+                "[scope-auth-unhealthy] "
+                f"scope_key={scope_key} "
+                f"name={getattr(spec, 'name', '')} "
+                f"url={getattr(spec, 'url', '')} "
+                f"status={feats.get('status_code')} "
+                f"final_url={feats.get('final_url')} "
+                f"auth_required_like={bool(feats.get('auth_required_like'))} "
+                f"session_expired_like={bool(feats.get('session_expired_like'))} "
+                f"external_auth_redirect_like={bool(feats.get('external_auth_redirect_like'))}"
+            )
+            request_failures.append(
+                {
+                    "trigger": str(getattr(spec, "name", "") or ""),
+                    "method": str(getattr(spec, "method", "") or "").upper(),
+                    "url": str(getattr(spec, "url", "") or ""),
+                    "error": "Authenticated request appears to have lost session or been redirected to authentication.",
+                    "error_class": "AuthStateLoss",
+                    "error_phase": "response",
+                    "status_code": feats.get("status_code"),
+                    "final_url": feats.get("final_url"),
+                    "raw_ref": raw_path,
+                    "auth_state": auth_state,
+                    "auth_required_like": bool(feats.get("auth_required_like")),
+                    "session_expired_like": bool(feats.get("session_expired_like")),
+                    "external_auth_redirect_like": bool(feats.get("external_auth_redirect_like")),
+                }
+            )
+
     def _update_scope_baseline_health(
         *,
         scope_state: Dict[str, Any],
@@ -1948,8 +2026,10 @@ async def process_plan(
     ) -> tuple[bool, str]:
         if scope_key in unhealthy_scopes:
             scope_state["baseline_unhealthy"] = True
+            if int(scope_state.get("auth_failure_count", 0)) > 0:
+                scope_state["auth_unhealthy"] = True
 
-        if not scope_state.get("baseline_unhealthy"):
+        if not scope_state.get("baseline_unhealthy") and not scope_state.get("auth_unhealthy"):
             return False, ""
 
         family = str(getattr(spec, "family", "") or "").strip().lower()
@@ -1963,7 +2043,7 @@ async def process_plan(
         }
 
         if family in skip_families:
-            return True, "baseline_unhealthy_scope"
+            return True, "auth_unhealthy_scope" if scope_state.get("auth_unhealthy") else "baseline_unhealthy_scope"
 
         return False, ""
 
@@ -2227,6 +2307,15 @@ async def process_plan(
 
             req_meta = _build_request_meta(spec)
             feats = extract_features(req_meta, snap)
+            auth_state = _effective_auth_state(spec)
+            _update_scope_auth_health(
+                scope_state=scope_state,
+                scope_key=scope_key,
+                spec=spec,
+                feats=feats,
+                auth_state=auth_state,
+                raw_path=str(raw_path),
+            )
             candidates = apply_base_severity_to_candidates(
                 generate_candidates(req_meta, snap, feats)
             )

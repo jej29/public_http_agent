@@ -257,11 +257,11 @@ def _best_exposed_information(finding: Dict[str, Any]) -> List[str]:
         or finding.get("normalized_exposed_information")
         or finding.get("exposed_information")
         or [],
-        limit=6,
+        limit=10,
     )
     explicit = _dedup_str_list(
         [_sanitize_exposed_item(finding, item) for item in explicit_raw if _sanitize_exposed_item(finding, item)],
-        limit=6,
+        limit=10,
     )
     if explicit:
         return explicit
@@ -420,6 +420,16 @@ def _build_compact_evidence_summary(finding: Dict[str, Any]) -> Dict[str, Any]:
 
     if evidence.get("phpinfo_indicators"):
         summary["phpinfo_indicators"] = _dedup_str_list(evidence.get("phpinfo_indicators") or [], limit=5)
+
+    if evidence.get("phpinfo_extracted_values"):
+        summary["phpinfo_extracted_values"] = _dedup_str_list(
+            [
+                item.get("display")
+                for item in (evidence.get("phpinfo_extracted_values") or [])
+                if isinstance(item, dict) and item.get("display")
+            ],
+            limit=8,
+        )
 
     if evidence.get("config_exposure_markers"):
         summary["config_exposure_markers"] = _dedup_str_list(evidence.get("config_exposure_markers") or [], limit=8)
@@ -638,8 +648,8 @@ def serialize_compact_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
         "trigger_count": finding.get("trigger_count") or len(finding.get("events") or []),
         "primary_evidence": primary_evidence,
         "exposed_information": exposed_information,
-        "normalized_exposed_information": _dedup_str_list(finding.get("normalized_exposed_information") or [], limit=6),
-        "exposed_information_raw": _dedup_str_list(finding.get("exposed_information_raw") or [], limit=8),
+        "normalized_exposed_information": _dedup_str_list(finding.get("normalized_exposed_information") or [], limit=10),
+        "exposed_information_raw": _dedup_str_list(finding.get("exposed_information_raw") or [], limit=12),
         "llm_evidence_review": finding.get("llm_evidence_review"),
         "severity_reason": severity_reason,
         "recommendation": recommendations,

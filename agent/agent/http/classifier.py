@@ -441,6 +441,12 @@ def _should_skip_resource_exposure(
     if status_code == 200 and _has_strong_config_payload(feats, snapshot):
         return False
 
+    if status_code == 200:
+        phpinfo_indicators = feats.get("phpinfo_indicators") or []
+        phpinfo_extracted_values = feats.get("phpinfo_extracted_values") or []
+        if phpinfo_extracted_values or len(phpinfo_indicators) >= 2:
+            return False
+
     if should_skip_info_disclosure(request_meta, snapshot, feats):
         return True
 

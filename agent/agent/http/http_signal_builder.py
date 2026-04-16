@@ -10,7 +10,7 @@ OWASP_ONLY_NO_CWE_REASON = (
 )
 
 
-def compact_signal_items(items: List[str], limit: int = 4) -> List[str]:
+def compact_signal_items(items: List[str], limit: int = 10) -> List[str]:
     out: List[str] = []
     seen = set()
     for item in items or []:
