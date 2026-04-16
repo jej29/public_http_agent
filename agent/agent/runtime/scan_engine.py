@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import os
+import re
 import asyncio
 import time
 from typing import Any, Dict, List
 from urllib.parse import parse_qsl, urlsplit, urlunsplit, urlencode
 
 import httpx
+from agent.candidates import generate_candidates
+from agent.analysis.features import extract_features
 from agent.runtime.candidate_finalizer import (
     _normalize_method_capability_candidates,
     finalize_without_reproduce,
@@ -2290,5 +2294,3 @@ async def process_plan(
         "request_failures": request_failures,
         "next_seq": seq,
     }
-
-
