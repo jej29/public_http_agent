@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 
 from agent.http.classifier import collect_http_signals
+from agent.findings.types import ensure_type_cwe_consistency
 
 OWASP_ONLY_NO_CWE_MAPPING = "OWASP_ONLY_NO_CWE_MAPPING"
 OWASP_ONLY_NO_CWE_REASON = (
@@ -207,6 +208,10 @@ def _build_candidate(
         "observation_scope",
         "verification_strategy",
         "signal_type",
+        "classification_source",
+        "cwe_source",
+        "severity_source",
+        "exposure_context",
         "cwe_mapping_status",
         "cwe_mapping_reason",
     ]
@@ -219,7 +224,7 @@ def _build_candidate(
         candidate["cwe_mapping_status"] = OWASP_ONLY_NO_CWE_MAPPING
         candidate["cwe_mapping_reason"] = OWASP_ONLY_NO_CWE_REASON
 
-    return candidate
+    return ensure_type_cwe_consistency(candidate)
 
 def generate_candidates(
     request_meta: Dict[str, Any],

@@ -1485,6 +1485,21 @@ def _looks_like_local_filesystem_path(path: str) -> bool:
     return _looks_like_local_windows_path(s) or _looks_like_local_unix_path(s)
 
 
+def _looks_like_printable_path(path: str) -> bool:
+    s = str(path or "").strip()
+    if not s:
+        return False
+    if any(ord(ch) < 32 and ch not in {"\t"} for ch in s):
+        return False
+    printable = sum(1 for ch in s if 32 <= ord(ch) <= 126)
+    ratio = printable / max(len(s), 1)
+    if ratio < 0.85:
+        return False
+    if len(re.findall(r"[A-Za-z0-9]", s)) < 3:
+        return False
+    return True
+
+
 def _is_same_or_child_request_path(candidate_path: str, request_url: str, final_url: str) -> bool:
     cand = (candidate_path or "").strip()
     if not cand.startswith("/"):
@@ -1522,6 +1537,8 @@ def _clean_file_paths(file_paths: List[str], request_url: str, final_url: str) -
         if re.fullmatch(r"[A-Za-z]:\\?", s):
             continue
         if s in {"/"}:
+            continue
+        if not _looks_like_printable_path(s):
             continue
         if _looks_like_url_derived_path(s):
             continue

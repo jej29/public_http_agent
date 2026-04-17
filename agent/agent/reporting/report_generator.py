@@ -92,6 +92,10 @@ def _severity_rank(severity: str) -> int:
     return order.get(str(severity or "Info"), 1)
 
 
+def _effective_severity(finding: Dict[str, Any]) -> str:
+    return str(finding.get("final_severity") or finding.get("severity") or "Info")
+
+
 def _write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -198,7 +202,7 @@ def _sort_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(
         findings or [],
         key=lambda finding: (
-            -_severity_rank(str(finding.get("severity") or "Info")),
+            -_severity_rank(_effective_severity(finding)),
             _group_of(finding),
             str(finding.get("title") or finding.get("type") or ""),
             str(finding.get("normalized_url") or ""),
@@ -209,7 +213,7 @@ def _sort_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _overview_table_row(finding: Dict[str, Any]) -> str:
     family = finding.get("family") or _group_of(finding)
     subtype = finding.get("subtype") or "-"
-    severity = finding.get("severity") or ""
+    severity = _effective_severity(finding)
     cwe = finding.get("cwe") or finding.get("cwe_mapping_status") or ""
     scope = finding.get("scope_hint") or "-"
     url = finding.get("normalized_url") or ""
@@ -228,9 +232,16 @@ def _compact_finding_json(finding: Dict[str, Any]) -> Dict[str, Any]:
         "type": finding.get("type"),
         "family": finding.get("family"),
         "subtype": finding.get("subtype"),
-        "severity": finding.get("severity"),
+        "severity": _effective_severity(finding),
         "confidence": finding.get("confidence"),
         "cwe": finding.get("cwe") or finding.get("cwe_mapping_status"),
+        "visibility_scope": finding.get("visibility_scope"),
+        "exposure_context": finding.get("exposure_context"),
+        "classification_source": finding.get("classification_source") or "rule_based",
+        "cwe_source": finding.get("cwe_source") or "rule_based_mapping",
+        "severity_source": finding.get("severity_source") or (
+            "validation_policy" if finding.get("final_severity") else "rule_based_policy"
+        ),
         "owasp": finding.get("owasp"),
         "scope_hint": finding.get("scope_hint"),
         "surface": finding.get("surface") or finding.get("where"),
@@ -260,7 +271,7 @@ def _compact_finding_json(finding: Dict[str, Any]) -> Dict[str, Any]:
 
 def _finding_markdown(finding: Dict[str, Any]) -> str:
     title = finding.get("title") or finding.get("type") or "Finding"
-    severity = finding.get("severity") or ""
+    severity = _effective_severity(finding)
     cwe = finding.get("cwe") or finding.get("cwe_mapping_status") or "N/A"
     owasp = finding.get("owasp") or "N/A"
     where = finding.get("where") or finding.get("surface") or ""
@@ -276,10 +287,19 @@ def _finding_markdown(finding: Dict[str, Any]) -> str:
     technology = ", ".join(_normalize_technology_fingerprint(finding.get("technology_fingerprint") or [])) or "-"
     template = finding.get("template_fingerprint") or "-"
     confidence = finding.get("confidence")
+    visibility_scope = finding.get("visibility_scope") or "-"
+    exposure_context = finding.get("exposure_context") or "-"
+    classification_source = finding.get("classification_source") or "rule_based"
+    cwe_source = finding.get("cwe_source") or "rule_based_mapping"
+    severity_source = finding.get("severity_source") or (
+        "validation_policy" if finding.get("final_severity") else "rule_based_policy"
+    )
 
     lines = [
         f"# {title}",
         "",
+        f"- Visibility Scope: `{visibility_scope}`",
+        f"- Exposure Context: `{exposure_context}`",
         f"- Family: `{family}`",
         f"- Subtype: `{subtype}`",
         f"- Severity: `{severity}`",
@@ -294,6 +314,9 @@ def _finding_markdown(finding: Dict[str, Any]) -> str:
         f"- Trigger Count: `{trigger_count}`",
         f"- Technology Fingerprint: `{technology}`",
         f"- Template Fingerprint: `{template}`",
+        f"- Classification Source: `{classification_source}`",
+        f"- CWE Source: `{cwe_source}`",
+        f"- Severity Source: `{severity_source}`",
     ]
 
     if root_cause_signature:

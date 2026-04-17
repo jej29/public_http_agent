@@ -67,6 +67,16 @@ def _dedup_str_list(items: List[Any], limit: int | None = None) -> List[str]:
     return out
 
 
+def _compress_route_listing_items(finding: Dict[str, Any], items: List[str]) -> List[str]:
+    if str(finding.get("type") or "") != "DIRECTORY_LISTING_ENABLED":
+        return items
+    evidence = finding.get("evidence") or {}
+    final_url = str(evidence.get("final_url") or finding.get("normalized_url") or "").strip()
+    if not final_url:
+        return items[:1]
+    return [f"Directory listing enabled at: {final_url}"]
+
+
 def _sanitize_exposed_item(finding: Dict[str, Any], item: Any) -> str | None:
     text = html.unescape(str(item or "")).replace("\ufffd", "").strip()
     text = " ".join(text.split())
@@ -643,14 +653,25 @@ def serialize_compact_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
     technology_fingerprint = _normalize_technology_fingerprint(
         finding.get("technology_fingerprint") or []
     )
+    effective_severity = str(finding.get("final_severity") or finding.get("severity") or "Info")
+    classification_source = finding.get("classification_source") or "rule_based"
+    cwe_source = finding.get("cwe_source") or "rule_based_mapping"
+    severity_source = finding.get("severity_source") or (
+        "validation_policy" if finding.get("final_severity") else "rule_based_policy"
+    )
 
     compact: Dict[str, Any] = {
         "type": finding.get("type"),
         "title": _best_title(finding),
-        "severity": finding.get("severity"),
+        "visibility_scope": finding.get("visibility_scope"),
+        "exposure_context": finding.get("exposure_context"),
+        "severity": effective_severity,
         "cwe": finding.get("cwe"),
         "cwe_mapping_status": finding.get("cwe_mapping_status"),
         "cwe_mapping_reason": finding.get("cwe_mapping_reason"),
+        "classification_source": classification_source,
+        "cwe_source": cwe_source,
+        "severity_source": severity_source,
         "owasp": finding.get("owasp"),
         "family": finding.get("family"),
         "subtype": finding.get("subtype"),
@@ -663,24 +684,29 @@ def serialize_compact_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
         "confidence": finding.get("confidence"),
         "trigger_count": finding.get("trigger_count") or len(finding.get("events") or []),
         "primary_evidence": primary_evidence,
-        "exposed_information": exposed_information,
-        "normalized_exposed_information": _dedup_str_list(finding.get("normalized_exposed_information") or [], limit=10),
-        "exposed_information_raw": _dedup_str_list(finding.get("exposed_information_raw") or [], limit=12),
+        "exposed_information": _compress_route_listing_items(finding, exposed_information),
+        "normalized_exposed_information": _compress_route_listing_items(
+            finding,
+            _dedup_str_list(finding.get("normalized_exposed_information") or [], limit=10),
+        ),
+        "exposed_information_raw": _compress_route_listing_items(
+            finding,
+            _dedup_str_list(finding.get("exposed_information_raw") or [], limit=12),
+        ),
         "llm_evidence_review": finding.get("llm_evidence_review"),
         "severity_reason": severity_reason,
         "recommendation": recommendations,
         "technology_fingerprint": technology_fingerprint,
         "template_fingerprint": finding.get("template_fingerprint"),
         "root_cause_signature": finding.get("root_cause_signature"),
+        "anonymous_behavior": finding.get("anonymous_behavior"),
+        "newly_exposed_information": _dedup_str_list(finding.get("newly_exposed_information") or [], limit=10),
         "evidence_summary": _build_compact_evidence_summary(finding),
     }
 
     best_reason = _best_reason(finding)
     if best_reason:
         compact["reason"] = best_reason
-
-    if finding.get("final_severity"):
-        compact["final_severity"] = finding.get("final_severity")
 
     if finding.get("llm_severity"):
         compact["llm_severity"] = finding.get("llm_severity")

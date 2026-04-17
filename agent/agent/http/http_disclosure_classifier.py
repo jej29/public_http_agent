@@ -577,6 +577,8 @@ def _build_non_error_body_disclosure_signals(
         return []
     if _looks_like_generic_notfound_template(snapshot, feats):
         return []
+    if feats.get("directory_listing_hints"):
+        return []
 
     strong_versions = _dedup(feats.get("strong_version_tokens_in_body") or [])
     framework_hints = _dedup(feats.get("framework_hints") or [])

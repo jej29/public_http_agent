@@ -144,6 +144,7 @@ def _classification_rank(finding: Dict[str, Any]) -> tuple[int, int, int, int]:
     confidence = float(finding.get("confidence") or 0.0)
 
     type_priority = {
+        "AUTHENTICATED_ONLY_INFORMATION_DISCLOSURE": 102,
         "HTTP_CONFIG_FILE_EXPOSURE": 110,
         "PHPINFO_EXPOSURE": 105,
         "LOG_VIEWER_EXPOSURE": 100,
@@ -533,6 +534,9 @@ def merge_finding(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, An
         "cwe",
         "cwe_mapping_status",
         "cwe_mapping_reason",
+        "classification_source",
+        "cwe_source",
+        "severity_source",
         "owasp",
         "family",
         "subtype",
@@ -552,6 +556,9 @@ def merge_finding(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, An
         "final_severity",
         "severity_validation_reason",
         "reproduction_attempts",
+        "exposure_context",
+        "visibility_scope",
+        "anonymous_behavior",
         "where",
         "status_code",
         "normalized_url",

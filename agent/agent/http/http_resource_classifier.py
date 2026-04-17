@@ -497,6 +497,10 @@ def _build_directory_listing_signals(
     if _looks_like_generic_notfound_template(snapshot, feats):
         return []
 
+    route_label = str(final_url or "").strip() or "/"
+    compact_hints = _dedup([str(item or "").strip() for item in hints])[:3]
+    exposed_information = [f"Directory listing enabled at: {route_label}"]
+
     return [
         _build_signal(
             signal_type="directory_listing",
@@ -509,13 +513,13 @@ def _build_directory_listing_signals(
             where="response.body",
             evidence={
                 "response_kind": response_kind,
-                "directory_listing_hints": hints,
+                "directory_listing_hints": compact_hints,
                 "final_url": final_url,
                 "redirect_chain": snapshot.get("redirect_chain", []),
             },
-            exposed_information=[f"Directory listing detected: {item}" for item in hints],
+            exposed_information=exposed_information,
             leak_type="directory_listing",
-            leak_value=_first(hints),
+            leak_value=route_label,
             cwe="CWE-548",
             owasp="A05:2021 Security Misconfiguration",
             scope_hint="route-specific",
@@ -798,7 +802,7 @@ def _build_phpinfo_signal(
             exposed_information=_dedup(exposed_information)[:12],
             leak_type="phpinfo_page",
             leak_value=final_url,
-            cwe="CWE-200",
+            cwe="CWE-538",
             owasp="A05:2021 Security Misconfiguration",
             scope_hint="route-specific",
             policy_object="phpinfo_page",
@@ -1008,7 +1012,7 @@ def _build_config_exposure_signal(
             exposed_information=exposed_information,
             leak_type="config_content",
             leak_value=representative_leak,
-            cwe="CWE-200",
+            cwe="CWE-497",
             owasp="A05:2021 Security Misconfiguration",
             scope_hint="route-specific",
             policy_object="config_file",

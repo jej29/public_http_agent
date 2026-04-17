@@ -71,6 +71,7 @@ from agent.runtime.scan_results import (
 from agent.runtime.scan_engine import (
     _build_request_meta,
     _finalize_candidate,
+    _response_to_snapshot,
     _store_with_verdict_precedence,
     maybe_authenticate,
     process_plan,
@@ -460,6 +461,157 @@ async def _run_authenticated_business_probes(
     )
 
 
+async def _run_information_disclosure_differential_replay(
+    *,
+    target: str,
+    authenticated: bool,
+    confirmed_map: Dict[str, Dict[str, Any]],
+    informational_map: Dict[str, Dict[str, Any]],
+    limits: httpx.Limits,
+    client_timeout: httpx.Timeout,
+    timeout_s: float,
+    run_dir: Path,
+    raw_index: List[Dict[str, Any]],
+    request_failures: List[Dict[str, Any]],
+    seq_start: int,
+) -> int:
+    if not authenticated:
+        return seq_start
+
+    candidate_urls: List[str] = []
+    for finding in list(confirmed_map.values()) + list(informational_map.values()):
+        if finding_group(finding) != "information_disclosure":
+            continue
+
+        evidence = finding.get("evidence") or {}
+        for candidate in (
+            evidence.get("final_url"),
+            evidence.get("requested_url"),
+            finding.get("normalized_url"),
+        ):
+            url = str(candidate or "").strip()
+            if not url or not same_origin(url, target):
+                continue
+            if url not in candidate_urls:
+                candidate_urls.append(url)
+
+    if not candidate_urls:
+        return seq_start
+
+    candidate_urls = candidate_urls[:24]
+    raw_dir = run_dir / "raw"
+    seq = seq_start
+    anonymous_client = build_anonymous_replay_client(
+        limits=limits,
+        client_timeout=client_timeout,
+        follow_redirects=True,
+    )
+
+    try:
+        for url in candidate_urls:
+            spec = RequestSpec(
+                name="diff_anon_replay",
+                method="GET",
+                url=url,
+                headers={
+                    "User-Agent": "LLM-DAST-Agent/1.0",
+                    "Accept": "*/*",
+                    "Accept-Language": "en",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+                source="differential_replay",
+                family="information_disclosure_diff",
+                mutation_class="anonymous_visibility_replay",
+                surface_hint="response.body",
+                expected_signal="authenticated_only_information_disclosure",
+                comparison_group="differential_visibility",
+                auth_state="anonymous",
+                follow_redirects=True,
+            )
+
+            start = asyncio.get_event_loop().time()
+            try:
+                resp = await anonymous_client.get(url, headers=spec.headers, follow_redirects=True, timeout=timeout_s)
+                elapsed_ms = int((asyncio.get_event_loop().time() - start) * 1000)
+                snapshot = _response_to_snapshot(resp, elapsed_ms)
+            except Exception as exc:
+                snapshot = {
+                    "ok": False,
+                    "status_code": None,
+                    "reason_phrase": None,
+                    "final_url": url,
+                    "headers": {},
+                    "headers_received": False,
+                    "content_type": "",
+                    "body_text": "",
+                    "body_snippet": "",
+                    "body_len": 0,
+                    "body_read_ok": False,
+                    "follow_redirects": True,
+                    "elapsed_ms": int((asyncio.get_event_loop().time() - start) * 1000),
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "error_class": type(exc).__name__,
+                    "error_phase": "request",
+                }
+
+            raw_path = save_raw_capture(raw_dir, seq, spec, snapshot)
+            snap_headers = snapshot.get("headers") or {}
+            if not isinstance(snap_headers, dict):
+                snap_headers = {}
+            body_text = str(snapshot.get("body_snippet") or snapshot.get("body_text") or "")
+
+            raw_index.append(
+                {
+                    "seq": seq,
+                    "request_name": spec.name,
+                    "method": spec.method,
+                    "url": spec.url,
+                    "raw_ref": str(raw_path),
+                    "status_code": snapshot.get("status_code"),
+                    "ok": bool(snapshot.get("ok")),
+                    "source": spec.source,
+                    "family": spec.family,
+                    "scope_key": url,
+                    "auth_state": "anonymous",
+                    "content_type": str(snap_headers.get("content-type") or snapshot.get("content_type") or ""),
+                    "body_len": len(body_text),
+                    "body_text": body_text,
+                    "final_url": str(snapshot.get("final_url") or url),
+                    "comparison_group": spec.comparison_group,
+                    "replay_priority": 0,
+                    "expected_signal": spec.expected_signal,
+                    "mutation_class": spec.mutation_class,
+                    "request_headers": dict(spec.headers),
+                    "request_body_len": 0,
+                    "request_body_present": False,
+                    "request_body_text": "",
+                }
+            )
+
+            if not snapshot.get("ok"):
+                request_failures.append(
+                    {
+                        "trigger": spec.name,
+                        "method": spec.method,
+                        "url": spec.url,
+                        "error": snapshot.get("error"),
+                        "error_class": snapshot.get("error_class"),
+                        "error_phase": snapshot.get("error_phase"),
+                        "status_code": snapshot.get("status_code"),
+                        "final_url": snapshot.get("final_url"),
+                        "raw_ref": str(raw_path),
+                        "auth_state": "anonymous",
+                    }
+                )
+
+            seq += 1
+    finally:
+        await anonymous_client.aclose()
+
+    return seq
+
+
 def _build_static_plan_from_endpoints(
     *,
     target: str,
@@ -782,28 +934,25 @@ def _normalize_type_cwe_consistency(candidate: Dict[str, Any]) -> Dict[str, Any]
 
     elif ctype == "DEFAULT_FILE_EXPOSED":
         if cwe not in {"CWE-552", None}:
-            candidate["cwe"] = None
-            candidate["cwe_mapping_status"] = OWASP_ONLY_NO_CWE_MAPPING
-            candidate["cwe_mapping_reason"] = (
-                "OWASP category is applicable, but the resource was not directly exposed "
-                "with a precise single CWE mapping in the current response."
-            )
+            candidate["cwe"] = "CWE-552"
+            candidate.pop("cwe_mapping_status", None)
+            candidate.pop("cwe_mapping_reason", None)
 
     elif ctype == "HTTP_CONFIG_FILE_EXPOSURE":
-        if cwe not in {"CWE-200", None}:
-            candidate["cwe"] = "CWE-200"
+        if cwe not in {"CWE-538", None}:
+            candidate["cwe"] = "CWE-538"
 
     elif ctype == "PHPINFO_EXPOSURE":
-        if cwe not in {"CWE-200", None}:
-            candidate["cwe"] = "CWE-200"
+        if cwe not in {"CWE-497", None}:
+            candidate["cwe"] = "CWE-497"
 
     elif ctype == "LOG_VIEWER_EXPOSURE":
         if cwe not in {"CWE-532", None}:
             candidate["cwe"] = "CWE-532"
 
     elif ctype == "FILE_PATH_HANDLING_ANOMALY":
-        if cwe not in {"CWE-200", None}:
-            candidate["cwe"] = "CWE-200"
+        if cwe not in {"CWE-497", None}:
+            candidate["cwe"] = "CWE-497"
 
     elif ctype == "CORS_MISCONFIG":
         candidate["cwe"] = "CWE-942"
@@ -1075,10 +1224,10 @@ async def llm_judge_if_enabled(candidate: Dict[str, Any], snapshot: Dict[str, An
         "HTTP_SYSTEM_INFO_EXPOSURE": {"CWE-497", None},
         "DIRECTORY_LISTING_ENABLED": {"CWE-548"},
         "DEFAULT_FILE_EXPOSED": {"CWE-552", None},
-        "HTTP_CONFIG_FILE_EXPOSURE": {"CWE-200", None},
-        "PHPINFO_EXPOSURE": {"CWE-200", None},
+        "HTTP_CONFIG_FILE_EXPOSURE": {"CWE-538", None},
+        "PHPINFO_EXPOSURE": {"CWE-497", None},
         "LOG_VIEWER_EXPOSURE": {"CWE-532", None},
-        "FILE_PATH_HANDLING_ANOMALY": {"CWE-200", None},
+        "FILE_PATH_HANDLING_ANOMALY": {"CWE-497", None},
         "CORS_MISCONFIG": {"CWE-942"},
         "COOKIE_HTTPONLY_MISSING": {"CWE-1004"},
         "COOKIE_SECURE_MISSING": {"CWE-614"},
@@ -2816,6 +2965,20 @@ async def run_scan(
         results["metadata"]["endpoint_access_control_replay"] = endpoint_replay_meta
         results["metadata"]["request_access_control_replay"] = request_replay_meta
         results["metadata"]["object_access_control_replay"] = object_replay_meta
+
+        next_seq = await _run_information_disclosure_differential_replay(
+            target=target,
+            authenticated=authenticated,
+            confirmed_map=confirmed_map,
+            informational_map=informational_map,
+            limits=limits,
+            client_timeout=client_timeout,
+            timeout_s=timeout_s,
+            run_dir=run_dir,
+            raw_index=raw_index,
+            request_failures=request_failures,
+            seq_start=next_seq,
+        )
 
         finalize_and_write_results(
             results=results,
