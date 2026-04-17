@@ -401,6 +401,14 @@ def _build_compact_evidence_summary(finding: Dict[str, Any]) -> Dict[str, Any]:
 
     if evidence.get("internal_ips"):
         summary["internal_ips"] = _dedup_str_list(evidence.get("internal_ips") or [], limit=5)
+    if evidence.get("writable_paths"):
+        summary["writable_paths"] = _dedup_str_list(evidence.get("writable_paths") or [], limit=5)
+    if evidence.get("setup_diagnostic_values"):
+        summary["setup_diagnostic_values"] = _dedup_str_list(evidence.get("setup_diagnostic_values") or [], limit=8)
+    if "direct_http_access_confirmed" in evidence:
+        summary["direct_http_access_confirmed"] = bool(evidence.get("direct_http_access_confirmed"))
+    if evidence.get("follow_up_constraints"):
+        summary["follow_up_constraints"] = _dedup_str_list(evidence.get("follow_up_constraints") or [], limit=3)
 
     if evidence.get("debug_hints"):
         summary["debug_hints"] = _dedup_str_list(evidence.get("debug_hints") or [], limit=5)
@@ -570,6 +578,10 @@ def _fallback_exposed_information_from_evidence(finding: Dict[str, Any]) -> List
 
     for x in _clean_file_paths_for_summary(evidence.get("file_paths") or []):
         out.append(f"File path: {x}")
+    for x in evidence.get("writable_paths") or []:
+        out.append(f"Writable path disclosed: {x}")
+    for x in evidence.get("setup_diagnostic_values") or []:
+        out.append(str(x))
 
     for x in evidence.get("db_errors") or []:
         out.append(f"Database error: {x}")

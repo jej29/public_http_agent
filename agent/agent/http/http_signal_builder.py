@@ -207,6 +207,7 @@ def build_signal(
     template_fingerprint: str | None = None,
     cwe_mapping_status: str | None = None,
     cwe_mapping_reason: str | None = None,
+    recommendation: List[str] | None = None,
 ) -> Dict[str, Any]:
     narrative = narrative_for_family(family)
     out = {
@@ -230,7 +231,7 @@ def build_signal(
         "technology_fingerprint": technology_fingerprint,
         "template_fingerprint": template_fingerprint,
         "why_it_matters": narrative["why"],
-        "recommendation": narrative["rec"],
+        "recommendation": recommendation or narrative["rec"],
         "cwe_mapping_status": cwe_mapping_status,
         "cwe_mapping_reason": cwe_mapping_reason or (
             OWASP_ONLY_NO_CWE_REASON if cwe_mapping_status else None

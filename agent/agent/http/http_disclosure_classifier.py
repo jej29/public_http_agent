@@ -127,6 +127,129 @@ def _meaningful_file_paths(items: List[str]) -> List[str]:
     return _dedup(out)
 
 
+def _clean_htmlish_text(value: str) -> str:
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"(?is)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?is)</(?:p|div|tr|li|h\d|td|th)>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
+
+
+def _extract_setup_diagnostic_values(
+    body_text: str,
+    feats: Dict[str, Any],
+) -> Dict[str, List[str]]:
+    plain = _clean_htmlish_text(body_text)
+    if not plain:
+        return {
+            "diagnostic_values": [],
+            "writable_paths": [],
+            "filesystem_paths": [],
+        }
+
+    diagnostic_values: List[str] = []
+    writable_paths: List[str] = []
+    filesystem_paths: List[str] = []
+
+    for item in (_meaningful_file_paths(feats.get("file_paths") or []) or [])[:6]:
+        filesystem_paths.append(item)
+
+    for item in (feats.get("config_extracted_values") or [])[:12]:
+        key = str(item.get("key") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if not key or not value:
+            continue
+        label = {
+            "db_host": "Database host",
+            "db_name": "Database name",
+            "db_user": "Database username",
+            "db_password": "Database password",
+            "db_port": "Database port",
+        }.get(key.lower())
+        if label:
+            diagnostic_values.append(f"{label}: {value}")
+
+    for item in (feats.get("phpinfo_extracted_values") or [])[:12]:
+        display = str(item.get("display") or "").strip()
+        if not display:
+            continue
+        display_l = display.lower()
+        if any(
+            token in display_l
+            for token in (
+                "server_software:",
+                "server_addr:",
+                "remote_addr:",
+                "document_root:",
+                "script_filename:",
+                "loaded configuration file:",
+                "configuration file (php.ini) path:",
+            )
+        ):
+            diagnostic_values.append(display)
+
+    for item in (_dedup(feats.get("strong_version_tokens_in_body") or []) or [])[:4]:
+        token = str(item).strip()
+        if not token:
+            continue
+        if token.lower().startswith("php/"):
+            diagnostic_values.append(f"PHP version: {token}")
+        else:
+            diagnostic_values.append(f"Server software: {token}")
+
+    writable_patterns = [
+        re.compile(
+            r"(?im)\b(?:writable|writeable)\s+(?:folder|directory|path)\s+([A-Za-z]:\\[^\s<]+|/(?:[^/\s<]+/)*[^<:\n]+/?)[\s:=-]+(yes|no|true|false|writable|not writable)\b"
+        ),
+        re.compile(
+            r"(?im)\b(?:folder|directory|path)\s+([A-Za-z]:\\[^\s<]+|/(?:[^/\s<]+/)*[^<:\n]+/?)\s+(?:is\s+)?(writable|writeable|readable|not writable|not writeable)\b"
+        ),
+    ]
+    for pattern in writable_patterns:
+        for path_value, state in pattern.findall(plain):
+            normalized_path = _clean_disclosure_text(path_value).rstrip(" :")
+            normalized_state = _clean_disclosure_text(state).lower()
+            if not normalized_path:
+                continue
+            readable_state = {
+                "yes": "writable",
+                "true": "writable",
+                "writable": "writable",
+                "writeable": "writable",
+                "no": "not writable",
+                "false": "not writable",
+            }.get(normalized_state, normalized_state)
+            writable_paths.append(f"{normalized_path} ({readable_state})")
+            filesystem_paths.append(normalized_path)
+
+    labeled_patterns = [
+        re.compile(
+            r"(?im)\b(server user|web server user|process user|running as|document root|config file|configuration file|upload folder|uploads folder|temp directory|temporary directory)\s*[:=]\s*(.{1,200})$"
+        ),
+        re.compile(
+            r"(?im)\b(php version|server software|database host|database username|database user|database name|database password)\s*[:=]\s*(.{1,200})$"
+        ),
+    ]
+    for pattern in labeled_patterns:
+        for label, value in pattern.findall(plain):
+            clean_label = _clean_disclosure_text(label)
+            clean_value = _clean_disclosure_text(value)
+            if not clean_label or not clean_value:
+                continue
+            diagnostic_values.append(f"{clean_label}: {clean_value[:200]}")
+            if re.search(r"(?i)(?:[A-Za-z]:\\|/(?:usr|var|etc|opt|home|srv|tmp|app|workspace)/)", clean_value):
+                filesystem_paths.append(clean_value[:200])
+
+    return {
+        "diagnostic_values": _dedup(diagnostic_values)[:12],
+        "writable_paths": _dedup(writable_paths)[:8],
+        "filesystem_paths": _dedup(filesystem_paths)[:10],
+    }
+
+
 def _first(items: List[str]) -> str:
     values = _dedup(items)
     return values[0] if values else ""
@@ -503,6 +626,92 @@ def _build_non_error_body_disclosure_signals(
     ]
 
 
+def _build_setup_diagnostic_disclosure_signals(
+    request_meta: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    feats: Dict[str, Any],
+    response_kind: str,
+    final_url: str,
+    technology_fingerprint: List[str],
+    tech: str,
+) -> List[Dict[str, Any]]:
+    if _status_code(snapshot, feats) != 200:
+        return []
+    if _is_auth_redirect(snapshot) or _is_static_response(feats):
+        return []
+    if _is_auth_or_session_loss(feats):
+        return []
+    if _looks_like_generic_notfound_template(snapshot, feats):
+        return []
+
+    body_text = _body_text(snapshot, feats)
+    diagnostics = _extract_setup_diagnostic_values(body_text, feats)
+    diagnostic_values = diagnostics.get("diagnostic_values") or []
+    writable_paths = diagnostics.get("writable_paths") or []
+    filesystem_paths = diagnostics.get("filesystem_paths") or []
+    setup_like = looks_like_setup_or_install_page(final_url, body_text)
+
+    if not setup_like and not writable_paths:
+        return []
+
+    internal_ips = _dedup(feats.get("internal_ips") or [])
+    strong_versions = _dedup(feats.get("strong_version_tokens_in_body") or [])
+
+    exposed_information: List[str] = []
+    exposed_information.extend(diagnostic_values[:8])
+    exposed_information.extend([f"Writable path disclosed: {item}" for item in writable_paths[:4]])
+    exposed_information.extend([f"File path: {item}" for item in filesystem_paths[:4]])
+    exposed_information.extend([f"Internal IP: {item}" for item in internal_ips[:2]])
+    exposed_information = _dedup(exposed_information)
+    if not exposed_information:
+        return []
+
+    severity = "Medium" if writable_paths or filesystem_paths else "Low"
+    confidence = 0.9 if writable_paths or len(diagnostic_values) >= 3 else 0.83
+
+    return [
+        _build_signal(
+            signal_type="setup_diagnostic_disclosure",
+            finding_type="HTTP_SYSTEM_INFO_EXPOSURE",
+            family="HTTP_BODY_DISCLOSURE",
+            subtype="setup_diagnostics",
+            title="Setup Or Diagnostic Page Discloses Internal Environment Details",
+            severity=severity,
+            confidence=confidence,
+            where="response.body",
+            evidence={
+                "final_url": final_url,
+                "requested_url": str(request_meta.get("url") or ""),
+                "response_kind": response_kind,
+                "setup_diagnostic_values": diagnostic_values,
+                "writable_paths": writable_paths,
+                "file_paths": filesystem_paths,
+                "internal_ips": internal_ips,
+                "strong_version_tokens_in_body": strong_versions,
+                "technology_fingerprint": technology_fingerprint,
+                "direct_http_access_confirmed": False,
+                "follow_up_constraints": [
+                    "The scanner confirmed disclosure of an internal path or writable location, but did not confirm direct HTTP access to that filesystem location in-band."
+                ],
+            },
+            exposed_information=exposed_information[:10],
+            recommendation=[
+                "Remove internal absolute paths, writable-directory status, and environment details from setup, install, status, or diagnostic pages.",
+                "Treat disclosed writable paths as potentially actionable follow-up targets if additional host or application privileges are later obtained.",
+                "Direct HTTP access to the disclosed filesystem path was not confirmed during this scan and should be verified separately if higher privileges become available.",
+            ],
+            leak_type="setup_diagnostics",
+            leak_value=_first(writable_paths) or _first(filesystem_paths) or _first(diagnostic_values) or final_url,
+            cwe="CWE-497",
+            owasp="A05:2021 Security Misconfiguration",
+            scope_hint="route-specific",
+            policy_object="response_body",
+            root_cause_signature=f"setupdiag:{tech}|setup:{setup_like}|writable:{bool(writable_paths)}",
+            technology_fingerprint=technology_fingerprint,
+        )
+    ]
+
+
 def build_file_path_handling_signal(
     request_meta: Dict[str, Any],
     snapshot: Dict[str, Any],
@@ -627,6 +836,17 @@ def build_disclosure_signals(
 
     out.extend(
         _build_header_disclosure_signals(
+            request_meta,
+            snapshot,
+            feats,
+            response_kind,
+            final_url,
+            technology_fingerprint,
+            tech,
+        )
+    )
+    out.extend(
+        _build_setup_diagnostic_disclosure_signals(
             request_meta,
             snapshot,
             feats,

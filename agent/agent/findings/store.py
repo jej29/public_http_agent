@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import urlsplit
 
 from agent.core.common import prune_empty
 from agent.findings.identity import finding_group, stable_finding_filename
@@ -35,6 +36,24 @@ def _dedup_str_list(items: List[Any], limit: int | None = None) -> List[str]:
     return out
 
 
+def _dedup_dict_list(items: List[Any], *, key_fields: tuple[str, ...], limit: int | None = None) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        marker = tuple(str(item.get(field) or "").strip() for field in key_fields)
+        if not any(marker):
+            continue
+        if marker in seen:
+            continue
+        seen.add(marker)
+        out.append(item)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
 def _severity_rank(sev: str) -> int:
     return {"Info": 1, "Low": 2, "Medium": 3, "High": 4}.get(str(sev or "Info"), 1)
 
@@ -54,6 +73,34 @@ def _split_product_version(token: str) -> tuple[str, str | None]:
         if name:
             return name, ver or None
     return s, None
+
+
+def _looks_like_synthetic_probe_url(url: str) -> bool:
+    lowered = str(url or "").lower()
+    return "__nonexistent_" in lowered
+
+
+def _prefer_scalar_url(existing_value: Any, new_value: Any) -> Any:
+    existing_text = str(existing_value or "").strip()
+    new_text = str(new_value or "").strip()
+    if not existing_text:
+        return new_value
+    if not new_text:
+        return existing_value
+
+    existing_synth = _looks_like_synthetic_probe_url(existing_text)
+    new_synth = _looks_like_synthetic_probe_url(new_text)
+    if existing_synth != new_synth:
+        return existing_value if not existing_synth else new_value
+
+    existing_parts = urlsplit(existing_text)
+    new_parts = urlsplit(new_text)
+    existing_query_penalty = 1 if existing_parts.query else 0
+    new_query_penalty = 1 if new_parts.query else 0
+    if existing_query_penalty != new_query_penalty:
+        return existing_value if existing_query_penalty < new_query_penalty else new_value
+
+    return existing_value if len(existing_text) <= len(new_text) else new_value
 
 
 def _normalize_technology_fingerprint(items: List[Any]) -> List[str]:
@@ -376,6 +423,7 @@ def merge_finding(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, An
         "stack_traces",
         "file_paths",
         "db_errors",
+        "runtime_error_messages",
         "internal_ips",
         "debug_hints",
         "framework_hints",
@@ -386,7 +434,9 @@ def merge_finding(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, An
         "missing",
         "present",
         "phpinfo_indicators",
+        "phpinfo_extracted_values",
         "config_exposure_markers",
+        "source_code_markers",
         "log_exposure_patterns",
         "query_param_names",
         "file_path_parameter_names",
@@ -405,7 +455,13 @@ def merge_finding(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, An
         _merge_unique_list(existing_evidence, field, new_evidence.get(field) or [])
 
     for field in list_fields:
-        if isinstance(existing_evidence.get(field), list):
+        if field == "phpinfo_extracted_values":
+            existing_evidence[field] = _dedup_dict_list(
+                existing_evidence.get(field) or [],
+                key_fields=("key", "display", "value"),
+                limit=20,
+            )
+        elif isinstance(existing_evidence.get(field), list):
             existing_evidence[field] = _dedup_str_list(existing_evidence[field])
 
     if new_evidence.get("banner_headers"):
@@ -462,7 +518,13 @@ def merge_finding(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, An
 
     for field in scalar_evidence_fields:
         if new_evidence.get(field) not in (None, "", [], {}):
-            existing_evidence[field] = new_evidence.get(field)
+            if field in {"final_url", "auth_final_url", "anon_final_url", "resource_url", "candidate_url"}:
+                existing_evidence[field] = _prefer_scalar_url(
+                    existing_evidence.get(field),
+                    new_evidence.get(field),
+                )
+            else:
+                existing_evidence[field] = new_evidence.get(field)
 
     preferred = _preferred_finding(existing, new)
     for scalar_field in (

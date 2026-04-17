@@ -627,4 +627,39 @@ chmod +x run-dvwa.sh
 8. [agent/agent/runtime/scan_engine.py](agent/agent/runtime/scan_engine.py)
 9. [agent/agent/findings/store.py](agent/agent/findings/store.py)
 10. [agent/agent/reporting/report_generator.py](agent/agent/reporting/report_generator.py)
+## Diagnostic Disclosure Notes
+
+최근 분류 로직에는 `setup/install/status/debug/info` 계열 페이지의 일반적인 diagnostic disclosure 탐지가 포함된다.
+
+- 절대 경로 노출
+- writable/upload/config directory 상태 노출
+- 런타임 버전 및 서버 환경 정보 노출
+- 설정 파일 위치 또는 setup check 결과 노출
+
+이 로직은 특정 테스트베드 전용 예외가 아니라, `diagnostic page + concrete local path/permission/runtime detail` 조합을 일반 규칙으로 처리한다.
+
+또한 planner는 위와 같은 경로에 한해 저위험 diagnostic query probe를 추가로 생성한다.
+
+- `?verbose=true`
+- `?debug=1`
+- `?diagnostic=1`
+
+목적은 기능 변경이 아니라, 이미 존재하는 진단/verbose 출력이 query flag에 따라 더 많이 드러나는지를 확인하는 것이다.
+## Authenticated DVWA Test Runs
+
+`run-dvwa.sh` supports authenticated test runs through environment variables so the same flow can be reused for cookie-based, form-based, or SSO-adjacent validation:
+
+- `AUTH_USERNAME`
+- `AUTH_PASSWORD`
+- `MANUAL_AUTH_COOKIE`
+- `MANUAL_AUTH_HEADERS`
+- `SCANNER_EXTRA_ARGS`
+
+Example:
+
+```bash
+AUTH_USERNAME=admin AUTH_PASSWORD=password TARGET_NAME=dvwa_auth ./run-dvwa.sh
+```
+
+For setup, installer, or diagnostic pages, disclosed filesystem paths and writable directories are reported as information disclosure even when the scanner cannot directly browse those filesystem locations over HTTP. In those cases the report now preserves the limitation explicitly: the path disclosure is meaningful, but direct follow-up access was not confirmed in-band during the scan.
 

@@ -301,6 +301,21 @@ def stable_key(finding: Dict[str, Any]) -> str:
                 subtype,
                 policy_object or "response_headers",
             ])
+        if subtype in {
+            "system_info",
+            "detector_internal_ip",
+            "detector_version_disclosure",
+            "detector_framework_hint",
+            "detector_internal_structure",
+        }:
+            scope = disclosure_url or route_scope or host_scope or normalized_final_url
+            return "||".join([
+                group,
+                ftype,
+                scope,
+                policy_object or "response_body",
+                "system_info_cluster",
+            ])
         scope = disclosure_url or route_scope or host_scope or normalized_final_url
         return "||".join([
             group,

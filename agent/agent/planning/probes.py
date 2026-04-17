@@ -810,6 +810,7 @@ def _directory_listing_specs(target_url: str, headers: Dict[str, str], intensity
 def _baseline_specs(target_url: str, headers: Dict[str, str]) -> List[RequestSpec]:
     existing = _existing_query_pairs(target_url)
     merged_query = _merge_query_pairs(existing, [("session", rand_suffix(6))])
+    path_l = (urlsplit(target_url).path or "/").lower()
 
     allow_head = os.getenv("ENABLE_HEAD_BASELINE", "off").lower() == "on"
 
@@ -876,6 +877,39 @@ def _baseline_specs(target_url: str, headers: Dict[str, str]) -> List[RequestSpe
                 follow_redirects=False,
             ),
         )
+
+    diagnostic_probe_tokens = (
+        "/setup",
+        "/install",
+        "/installer",
+        "/status",
+        "/debug",
+        "/diagnostic",
+        "/health",
+        "/info",
+    )
+    if any(token in path_l for token in diagnostic_probe_tokens):
+        for name, overrides in (
+            ("baseline_query_verbose", [("verbose", "true")]),
+            ("baseline_query_debug", [("debug", "1")]),
+            ("baseline_query_diagnostic", [("diagnostic", "1")]),
+        ):
+            specs.append(
+                RequestSpec(
+                    name=name,
+                    method="GET",
+                    url=_replace_query(target_url, _merge_query_pairs(existing, overrides)),
+                    headers=headers,
+                    source="static",
+                    family="baseline",
+                    mutation_class="benign_diagnostic_query",
+                    target_param=overrides[0][0],
+                    surface_hint="response.body",
+                    expected_signal="diagnostic_response_variation",
+                    comparison_group="baseline_query",
+                    follow_redirects=False,
+                )
+            )
 
     return specs
 

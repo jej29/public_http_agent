@@ -1908,10 +1908,23 @@ async def process_plan(
     ) -> bool:
         if str(auth_state or "").strip().lower() != "authenticated":
             return False
+        if feats.get("session_expired_like") or feats.get("external_auth_redirect_like"):
+            return True
+
+        if not feats.get("auth_required_like"):
+            return False
+
+        status_code = feats.get("status_code")
+        noise_flags = feats.get("response_noise_flags") or {}
+        is_login_like = bool(noise_flags.get("is_login_like"))
+        final_url_l = str(feats.get("final_url") or "").lower()
+        final_url_auth_like = any(tok in final_url_l for tok in ("login", "signin", "/auth", "/sso"))
+
         return bool(
-            feats.get("auth_required_like")
-            or feats.get("session_expired_like")
-            or feats.get("external_auth_redirect_like")
+            is_login_like
+            or final_url_auth_like
+            or status_code in {401, 407}
+            or (status_code in {301, 302, 303, 307, 308} and final_url_auth_like)
         )
 
     def _update_scope_auth_health(

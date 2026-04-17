@@ -140,10 +140,17 @@ def has_strong_system_info(candidate: Dict[str, Any]) -> bool:
     framework_hints = evidence.get("framework_hints") or []
     debug_hints = evidence.get("debug_hints") or []
     internal_ips = evidence.get("internal_ips") or []
+    setup_diagnostic_values = evidence.get("setup_diagnostic_values") or []
+    writable_paths = evidence.get("writable_paths") or []
+    file_paths = evidence.get("file_paths") or []
 
     if strong_versions or banner_headers:
         return True
     if len(framework_hints) >= 2 or len(debug_hints) >= 2:
+        return True
+    if writable_paths:
+        return True
+    if setup_diagnostic_values and file_paths:
         return True
     return bool(internal_ips and (strong_versions or banner_headers))
 

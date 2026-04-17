@@ -206,6 +206,8 @@ def _has_concrete_system_info(candidate: Dict[str, Any]) -> bool:
 
     strong_versions = evidence.get("strong_version_tokens_in_body") or []
     internal_ips = evidence.get("internal_ips") or []
+    writable_paths = evidence.get("writable_paths") or []
+    setup_diagnostic_values = evidence.get("setup_diagnostic_values") or []
     body_markers = evidence.get("body_info_markers") or []
     framework_hints = evidence.get("framework_hints") or []
     debug_hints = evidence.get("debug_hints") or []
@@ -221,6 +223,12 @@ def _has_concrete_system_info(candidate: Dict[str, Any]) -> bool:
 
     # strong version token? concrete
     if strong_versions:
+        return True
+
+    # setup/install/diagnostic page?먯꽌 writable path / local path / concrete env values媛 ?덈뒗 寃쎌슦
+    if writable_paths:
+        return True
+    if setup_diagnostic_values and file_paths:
         return True
 
     # internal IP??debug/error context媛 媛숈씠 ?덉쓣 ?뚮쭔 concrete
@@ -603,9 +611,16 @@ def validate_candidate_after_llm(candidate: Dict[str, Any]) -> Dict[str, Any]:
                 candidate["severity_validation_reason"] = (
                     "Concrete body-based system information disclosure retained after validation."
                 )
+                subtype = str(candidate.get("subtype") or "")
                 if verification.get("verdict") not in {"CONFIRMED", "INFORMATIONAL"}:
                     verification["verdict"] = "INFORMATIONAL"
-                    verification["reason"] = "Concrete system-information markers observed in response body."
+                    if subtype == "setup_diagnostics":
+                        verification["reason"] = (
+                            "Concrete internal paths or writable-location details were disclosed in a diagnostic response body. "
+                            "Direct HTTP access to the disclosed filesystem path was not confirmed during this scan."
+                        )
+                    else:
+                        verification["reason"] = "Concrete system-information markers observed in response body."
                 return _apply_final_verdict_state(candidate)
 
             return _set_informational(
