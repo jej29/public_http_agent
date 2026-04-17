@@ -154,16 +154,6 @@ def _annotate_visibility_scope(
 
     for key, finding in (bucket_map or {}).items():
         updated = dict(finding)
-        if str(updated.get("type") or "") not in {
-            "HTTP_CONFIG_FILE_EXPOSURE",
-            "PHPINFO_EXPOSURE",
-            "HTTP_SYSTEM_INFO_EXPOSURE",
-            "HTTP_ERROR_INFO_EXPOSURE",
-            "AUTHENTICATED_ONLY_INFORMATION_DISCLOSURE",
-        }:
-            annotated[key] = updated
-            continue
-
         evidence = updated.get("evidence") or {}
         route_key = normalize_url_for_dedup(
             str(
@@ -207,9 +197,18 @@ def _annotate_visibility_scope(
                 visibility_scope = "public_or_shared"
         elif auth_best:
             visibility_scope = "authenticated_observed_only"
+        elif anon_best:
+            visibility_scope = "public_or_shared"
 
         updated["visibility_scope"] = visibility_scope
         updated["anonymous_behavior"] = anonymous_behavior
+        if not updated.get("exposure_context"):
+            if visibility_scope == "authenticated_only":
+                updated["exposure_context"] = "differential_anonymous_vs_authenticated"
+            elif visibility_scope == "authenticated_observed_only":
+                updated["exposure_context"] = "authenticated"
+            elif visibility_scope == "public_or_shared":
+                updated["exposure_context"] = "public_or_shared"
         if newly_exposed_information:
             updated["newly_exposed_information"] = newly_exposed_information
 

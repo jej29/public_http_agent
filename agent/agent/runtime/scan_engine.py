@@ -1919,10 +1919,11 @@ async def process_plan(
         is_login_like = bool(noise_flags.get("is_login_like"))
         final_url_l = str(feats.get("final_url") or "").lower()
         final_url_auth_like = any(tok in final_url_l for tok in ("login", "signin", "/auth", "/sso"))
+        explicit_auth_markers = bool(feats.get("auth_required_like")) and not is_login_like
 
         return bool(
-            is_login_like
-            or final_url_auth_like
+            (is_login_like and (final_url_auth_like or status_code in {401, 403, 407}))
+            or (final_url_auth_like and explicit_auth_markers)
             or status_code in {401, 407}
             or (status_code in {301, 302, 303, 307, 308} and final_url_auth_like)
         )

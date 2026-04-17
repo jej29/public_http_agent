@@ -501,11 +501,12 @@ def _looks_like_auth_required_response(
     body_lower: str,
     login_like: bool,
 ) -> bool:
-    if status_code in {401, 403, 407}:
+    if status_code in {401, 407}:
         return True
     final_url_l = str(final_url or "").lower()
-    if any(token in final_url_l for token in ("/login", "/signin", "/sign-in", "login.php", "/auth", "/sso", "adfs", "oauth", "saml")):
-        return True
+    final_url_auth_like = any(
+        token in final_url_l for token in ("/login", "/signin", "/sign-in", "login.php", "/auth", "/sso", "adfs", "oauth", "saml")
+    )
     auth_required_markers = (
         "please log in",
         "please sign in",
@@ -519,7 +520,12 @@ def _looks_like_auth_required_response(
         "identity provider",
         "federated login",
     )
-    if any(marker in body_lower for marker in auth_required_markers):
+    has_auth_required_markers = any(marker in body_lower for marker in auth_required_markers)
+    if status_code == 403 and (final_url_auth_like or has_auth_required_markers or login_like):
+        return True
+    if final_url_auth_like and (login_like or has_auth_required_markers):
+        return True
+    if has_auth_required_markers:
         return True
     return login_like
 
@@ -542,13 +548,45 @@ def _looks_like_session_expired_response(body_lower: str, final_url: str) -> boo
     return any(token in final_url_l for token in ("sessionexpired", "session-expired", "timeout", "reauth"))
 
 
+def _looks_like_authenticated_app_shell(body_lower: str, final_url: str) -> bool:
+    final_url_l = str(final_url or "").lower()
+    if any(tok in final_url_l for tok in ("/logout", "logout.php")):
+        return False
+
+    logout_markers = (
+        "logout",
+        "log out",
+        "sign out",
+        "signout",
+    )
+    account_markers = (
+        "welcome ",
+        "my account",
+        "account settings",
+        "change password",
+        "profile",
+        "dashboard",
+        "portal",
+        "current:",
+    )
+
+    has_logout_control = any(marker in body_lower for marker in logout_markers)
+    account_hit_count = sum(1 for marker in account_markers if marker in body_lower)
+    has_authenticated_navigation = (
+        ("logout.php" in body_lower or 'href="/logout' in body_lower or " href=\"logout" in body_lower)
+        and account_hit_count >= 1
+    )
+    return bool(has_logout_control and (account_hit_count >= 1 or has_authenticated_navigation))
+
+
 def _looks_like_login_or_auth_page(body_lower: str, final_url: str) -> bool:
     final_url_l = str(final_url or "").lower()
-    if any(tok in final_url_l for tok in ("/login", "/signin", "/sign-in", "/auth", "/sso", "adfs", "oauth", "saml")):
-        return True
-
     if "<title>php" in body_lower and "phpinfo()" in body_lower:
         return False
+
+    has_url_auth_path = any(
+        tok in final_url_l for tok in ("/login", "/signin", "/sign-in", "/auth", "/sso", "adfs", "oauth", "saml")
+    )
 
     auth_heading_markers = (
         "please log in",
@@ -587,10 +625,18 @@ def _looks_like_login_or_auth_page(body_lower: str, final_url: str) -> bool:
     ))
     has_auth_heading = any(tok in body_lower for tok in auth_heading_markers)
     has_auth_ui = any(tok in body_lower for tok in auth_ui_markers)
+    looks_authenticated = _looks_like_authenticated_app_shell(body_lower, final_url)
 
+    if looks_authenticated and not has_url_auth_path:
+        return False
+    if looks_authenticated and not has_auth_heading and has_form:
+        return False
+
+    if has_url_auth_path and (has_password_input or has_auth_heading or has_auth_ui):
+        return True
     if has_auth_heading and (has_password_input or has_form or has_auth_ui):
         return True
-    if has_form and has_password_input and (has_identity_field or has_auth_heading):
+    if has_form and has_password_input and has_identity_field and (has_url_auth_path or has_auth_heading or has_auth_ui):
         return True
     return False
 

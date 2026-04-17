@@ -255,6 +255,47 @@ def select_primary_evidence(finding: Dict[str, Any], limit: int = 3) -> List[Dic
     return out
 
 
+def _default_visibility_scope(finding: Dict[str, Any]) -> str | None:
+    visibility_scope = str(finding.get("visibility_scope") or "").strip()
+    if visibility_scope:
+        return visibility_scope
+
+    evidence = finding.get("evidence") or {}
+    anon_status = evidence.get("anon_status_code")
+    auth_status = evidence.get("auth_status_code")
+    anonymous_behavior = str(
+        finding.get("anonymous_behavior") or evidence.get("anonymous_behavior") or ""
+    ).strip().lower()
+
+    if anon_status is not None:
+        try:
+            anon_status_code = int(anon_status)
+        except Exception:
+            anon_status_code = 0
+        if anonymous_behavior in {"blocked", "login_redirect_or_auth_page"} or anon_status_code in {401, 403}:
+            return "authenticated_only"
+        return "public_or_shared"
+
+    if auth_status is not None or evidence.get("auth_raw_ref"):
+        return "authenticated_observed_only"
+
+    return None
+
+
+def _default_exposure_context(finding: Dict[str, Any], visibility_scope: str | None) -> str | None:
+    exposure_context = str(finding.get("exposure_context") or "").strip()
+    if exposure_context:
+        return exposure_context
+
+    if visibility_scope == "authenticated_only":
+        return "differential_anonymous_vs_authenticated"
+    if visibility_scope == "authenticated_observed_only":
+        return "authenticated"
+    if visibility_scope == "public_or_shared":
+        return "public_or_shared"
+    return None
+
+
 def _refined_llm_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
     llm = finding.get("llm_judgement") or {}
     refined = llm.get("refined_finding") or {}
@@ -654,6 +695,8 @@ def serialize_compact_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
         finding.get("technology_fingerprint") or []
     )
     effective_severity = str(finding.get("final_severity") or finding.get("severity") or "Info")
+    visibility_scope = _default_visibility_scope(finding)
+    exposure_context = _default_exposure_context(finding, visibility_scope)
     classification_source = finding.get("classification_source") or "rule_based"
     cwe_source = finding.get("cwe_source") or "rule_based_mapping"
     severity_source = finding.get("severity_source") or (
@@ -663,8 +706,8 @@ def serialize_compact_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
     compact: Dict[str, Any] = {
         "type": finding.get("type"),
         "title": _best_title(finding),
-        "visibility_scope": finding.get("visibility_scope"),
-        "exposure_context": finding.get("exposure_context"),
+        "visibility_scope": visibility_scope,
+        "exposure_context": exposure_context,
         "severity": effective_severity,
         "cwe": finding.get("cwe"),
         "cwe_mapping_status": finding.get("cwe_mapping_status"),
