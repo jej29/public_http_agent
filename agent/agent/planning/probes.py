@@ -2731,7 +2731,35 @@ def build_authenticated_business_probe_plan(
             return True
         return False
 
-    def _score(ep: Dict[str, object]) -> int:
+    def _business_category(url: str, ep: Dict[str, object]) -> str:
+        path = _path(url).lower()
+        query_keys = _query_keys(url)
+        kind = str(ep.get("kind") or "").strip().lower()
+        if any(token in path for token in (
+            "config", "debug", "actuator", "phpinfo", ".env", ".git",
+            "backup", "log", "server-status", "server-info", "setup",
+        )):
+            return "diagnostic_or_config"
+        if any(token in path for token in ("/admin", "/manage", "/console", "/dashboard")):
+            return "admin"
+        if any(token in path for token in ("/api/", "/rest/", "/graphql")):
+            return "api"
+        if any(token in path for token in ("/upload", "/uploads", "/file", "/files", "/download", "/documents")):
+            return "file_or_upload"
+        if _objectish(url) or query_keys.intersection({
+            "id", "userid", "user_id", "accountid", "account_id",
+            "orderid", "order_id", "cardid", "card_id", "addressid",
+            "address_id", "basketid", "basket_id", "itemid", "item_id",
+            "email", "paymentid", "payment_id", "walletid", "wallet_id",
+        }):
+            return "object_or_record"
+        if kind == "form":
+            return "form"
+        if query_keys:
+            return "parameterized"
+        return "dynamic"
+
+    def _score(ep: Dict[str, object], *, candidate_origin: str) -> int:
         url = str(ep.get("url") or "").strip()
         if not url:
             return -999
@@ -2755,7 +2783,7 @@ def build_authenticated_business_probe_plan(
         if len(parts) == 1 and parts and _looks_like_identifier_segment(parts[0]):
             return -999
 
-        if "authenticated" not in states:
+        if "authenticated" not in states and candidate_origin != "anonymous":
             return -999
 
         score = 0
@@ -2764,6 +2792,8 @@ def build_authenticated_business_probe_plan(
             score += 20
         else:
             score += 6
+            if candidate_origin == "anonymous":
+                score -= 2
 
         if kind == "form":
             score += 10
@@ -2808,18 +2838,83 @@ def build_authenticated_business_probe_plan(
 
         return score
 
-    ranked: List[tuple[int, Dict[str, object]]] = []
-    for ep in authenticated_endpoints or []:
+    ranked: List[tuple[int, str, str, Dict[str, object]]] = []
+    candidate_entries: List[tuple[str, Dict[str, object]]] = []
+    seen_candidate_urls = set()
+    for origin, endpoints in (
+        ("authenticated", authenticated_endpoints or []),
+        ("anonymous", anonymous_endpoints or []),
+    ):
+        for ep in endpoints:
+            if not isinstance(ep, dict):
+                continue
+            url = str(ep.get("url") or "").strip()
+            if not url or url in seen_candidate_urls:
+                continue
+            seen_candidate_urls.add(url)
+            candidate_entries.append((origin, ep))
+
+    for candidate_origin, ep in candidate_entries:
         if not isinstance(ep, dict):
             continue
-        score = _score(ep)
+        score = _score(ep, candidate_origin=candidate_origin)
         if score < 0:
             continue
-        ranked.append((score, ep))
+        url = str(ep.get("url") or "").strip()
+        if not url:
+            continue
+        ranked.append((score, _business_category(url, ep), url, ep))
 
-    ranked.sort(key=lambda x: (-x[0], str(x[1].get("url") or "")))
+    grouped_by_route: Dict[str, List[tuple[int, str, str, Dict[str, object]]]] = {}
+    for item in ranked:
+        _score_value, _category, url, _ep = item
+        grouped_by_route.setdefault(_normalize_replay_key(url), []).append(item)
 
-    for idx, (priority, ep) in enumerate(ranked, start=1):
+    ranked = []
+    for items in grouped_by_route.values():
+        max_priority = max(score for score, _category, _url, _ep in items)
+        chosen_score, chosen_category, chosen_url, chosen_ep = sorted(
+            items,
+            key=lambda x: (x[1], len(urlsplit(x[2]).path or "/"), x[2]),
+        )[0]
+        ranked.append((max_priority, chosen_category, chosen_url, chosen_ep))
+
+    ranked.sort(key=lambda x: (-x[0], x[1], len(urlsplit(x[2]).path or "/"), x[2]))
+
+    default_quota = max(2, (max_targets + 4) // 5)
+    max_per_category = int(os.getenv("AUTHENTICATED_BUSINESS_PROBE_MAX_PER_CATEGORY", str(default_quota)))
+    selected: List[tuple[int, str, str, Dict[str, object]]] = []
+    category_counts: Dict[str, int] = {}
+    used_norm_keys = set()
+
+    for item in ranked:
+        priority, category, url, _ep = item
+        norm_key = _normalize_replay_key(url)
+        if norm_key in used_norm_keys:
+            continue
+        if category_counts.get(category, 0) >= max_per_category:
+            continue
+        selected.append(item)
+        used_norm_keys.add(norm_key)
+        category_counts[category] = category_counts.get(category, 0) + 1
+        if len(selected) >= max_targets:
+            break
+
+    if len(selected) < max_targets:
+        selected_keys = {_normalize_replay_key(url) for _, _, url, _ in selected}
+        for item in ranked:
+            _priority, _category, url, _ep = item
+            norm_key = _normalize_replay_key(url)
+            if norm_key in selected_keys:
+                continue
+            selected.append(item)
+            selected_keys.add(norm_key)
+            if len(selected) >= max_targets:
+                break
+
+    selected.sort(key=lambda x: (x[1], len(urlsplit(x[2]).path or "/"), x[2]))
+
+    for idx, (priority, _category, url, ep) in enumerate(selected, start=1):
         url = str(ep.get("url") or "").strip()
         if not url:
             continue

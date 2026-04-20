@@ -24,12 +24,32 @@ def build_effective_seed_urls(
     auth_landing_url: str | None,
     seed_urls: List[str] | None,
 ) -> List[str]:
+    target_value = str(target or "").strip()
     effective_seed_urls: List[str] = []
     for candidate in [target, auth_landing_url, *(seed_urls or [])]:
         value = str(candidate or "").strip()
         if value and value not in effective_seed_urls:
             effective_seed_urls.append(value)
-    return effective_seed_urls
+
+    if not effective_seed_urls:
+        return []
+
+    explicit_seeds = {str(seed or "").strip() for seed in (seed_urls or []) if str(seed or "").strip()}
+
+    def _seed_sort_key(url: str) -> tuple:
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        is_target = url == target_value
+        is_seed = url in explicit_seeds
+        return (
+            0 if is_target else 1 if is_seed else 2,
+            len(path),
+            path,
+            parsed.query or "",
+            parsed.netloc.lower(),
+        )
+
+    return sorted(effective_seed_urls, key=_seed_sort_key)
 
 
 async def discover_authenticated_endpoints(

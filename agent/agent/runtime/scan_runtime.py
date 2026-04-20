@@ -386,6 +386,27 @@ async def _process_auth_snapshots(
     return seq
 
 
+def _probe_target_category(url: str) -> str:
+    path = (urlsplit(str(url or "")).path or "/").lower()
+    query = urlsplit(str(url or "")).query or ""
+    if any(token in path for token in (
+        "config", "debug", "actuator", "phpinfo", ".env", ".git",
+        "backup", "log", "server-status", "server-info", "setup",
+    )):
+        return "diagnostic_or_config"
+    if any(token in path for token in ("/admin", "/manage", "/console", "/dashboard")):
+        return "admin"
+    if any(token in path for token in ("/api/", "/rest/", "/graphql")):
+        return "api"
+    if any(token in path for token in ("/upload", "/uploads", "/file", "/files", "/download", "/documents")):
+        return "file_or_upload"
+    if re.search(r"/(?:\d+|[0-9a-f]{8,})(?:/|$)", path, re.I):
+        return "object_or_record"
+    if query:
+        return "parameterized"
+    return "dynamic"
+
+
 async def _run_authenticated_business_probes(
     *,
     client: httpx.AsyncClient,
@@ -405,6 +426,7 @@ async def _run_authenticated_business_probes(
     request_failures: List[Dict[str, Any]],
     seq_start: int,
     shared_unhealthy_scopes: set[str] | None = None,
+    probe_metadata: List[Dict[str, Any]] | None = None,
 ) -> int:
     if not authenticated:
         return seq_start
@@ -441,6 +463,22 @@ async def _run_authenticated_business_probes(
     if not auth_business_plan:
         log("AUTH", "Authenticated business probes skipped: only session-destructive targets remained")
         return seq_start
+
+    selected_targets: List[Dict[str, Any]] = []
+    for idx, spec in enumerate(auth_business_plan, start=1):
+        spec_url = str(getattr(spec, "url", "") or "")
+        selected_targets.append({
+            "rank": idx,
+            "name": str(getattr(spec, "name", "") or ""),
+            "method": str(getattr(spec, "method", "") or ""),
+            "url": spec_url,
+            "replay_key": str(getattr(spec, "replay_key", "") or ""),
+            "priority": int(getattr(spec, "replay_priority", 0) or 0),
+            "source_url": str(getattr(spec, "replay_source_url", "") or ""),
+            "category": _probe_target_category(spec_url),
+        })
+    if probe_metadata is not None:
+        probe_metadata.extend(selected_targets)
 
     log("AUTH", f"Running authenticated business probes against {len(auth_business_plan)} targets")
     return await _run_plan_and_merge(
@@ -2493,6 +2531,20 @@ async def run_scan(
                 "follow_redirects": follow_redirects,
                 "allowed_app_prefixes": [],
                 "external_redirect_observations": [],
+                "runtime_config": {
+                    "llm_mode": os.getenv("LLM_MODE", "off"),
+                    "llm_probe_planner_mode": os.getenv("LLM_PROBE_PLANNER_MODE", "off"),
+                    "llm_report_mode": os.getenv("LLM_REPORT_MODE", "off"),
+                    "crawl_include_js_paths": os.getenv("CRAWL_INCLUDE_JS_PATHS", "on"),
+                    "max_endpoints": os.getenv("MAX_ENDPOINTS", "200"),
+                    "authenticated_business_probe_max_targets": os.getenv(
+                        "AUTHENTICATED_BUSINESS_PROBE_MAX_TARGETS", "20"
+                    ),
+                    "authenticated_business_probe_max_per_category": os.getenv(
+                        "AUTHENTICATED_BUSINESS_PROBE_MAX_PER_CATEGORY", ""
+                    ),
+                    "access_control_replay_max_targets": os.getenv("ACCESS_CONTROL_REPLAY_MAX_TARGETS", "20"),
+                },
             },
             "summary": {},
             "findings_confirmed": [],
@@ -2509,6 +2561,7 @@ async def run_scan(
         informational_map: Dict[str, Dict[str, Any]] = {}
         false_positive_map: Dict[str, Dict[str, Any]] = {}
         request_failures: List[Dict[str, Any]] = []
+        authenticated_business_probe_targets: List[Dict[str, Any]] = []
 
         next_seq = 1
         authenticated = False
@@ -2696,6 +2749,7 @@ async def run_scan(
                 request_failures=request_failures,
                 seq_start=next_seq,
                 shared_unhealthy_scopes=shared_unhealthy_scopes,
+                probe_metadata=authenticated_business_probe_targets,
             )
         elif authenticated and http_only_mode:
             log("AUTH", "Authenticated business probes skipped: HTTP_ONLY_MODE=true")
@@ -2725,6 +2779,7 @@ async def run_scan(
         results["metadata"]["auth_landing_url"] = auth_landing_url
         results["metadata"]["anonymous_endpoint_count"] = len(filtered_anonymous_endpoints)
         results["metadata"]["authenticated_endpoint_count"] = len(filtered_authenticated_endpoints)
+        results["metadata"]["selected_authenticated_business_probe_targets"] = authenticated_business_probe_targets
 
         llm_planner_enabled = os.getenv("LLM_PROBE_PLANNER_MODE", "off").lower() == "on"
         llm_midpoint_ratio = float(os.getenv("LLM_PLANNER_MIDPOINT_RATIO", "0.40"))

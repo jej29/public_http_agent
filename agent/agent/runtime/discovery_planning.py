@@ -56,6 +56,29 @@ def endpoint_states(ep: Any) -> List[str]:
     return out
 
 
+def canonical_endpoint_sort_key(ep: Any) -> tuple:
+    url = endpoint_url(ep)
+    parts = urlsplit(url)
+    states = ",".join(endpoint_states(ep))
+    kind = endpoint_kind(ep)
+    method = str(ep.get("method") or "GET").upper() if isinstance(ep, dict) else "GET"
+    score = int(ep.get("score", 0) or 0) if isinstance(ep, dict) else 0
+    depth = int(ep.get("depth", 9999) or 9999) if isinstance(ep, dict) else 9999
+    return (
+        bool(is_session_destructive_endpoint(ep)),
+        -score,
+        kind == "static",
+        depth,
+        len(parts.path or "/"),
+        parts.path or "/",
+        parts.query or "",
+        method,
+        states,
+        parts.scheme.lower(),
+        parts.netloc.lower(),
+    )
+
+
 def is_authenticated_only_endpoint(ep: Any) -> bool:
     states = set(endpoint_states(ep))
     return "authenticated" in states and "anonymous" not in states
@@ -200,17 +223,7 @@ def merge_discovered_endpoints(*endpoint_lists: List[Dict[str, Any]]) -> List[Di
             if not existing.get("source") and endpoint.get("source"):
                 existing["source"] = endpoint["source"]
 
-    ranked = list(merged.values())
-    ranked.sort(
-        key=lambda ep: (
-            bool(ep.get("is_session_destructive")),
-            -ep.get("score", 0),
-            ep.get("kind") == "static",
-            len(urlsplit(ep["url"]).path),
-            urlsplit(ep["url"]).path,
-            urlsplit(ep["url"]).query,
-        )
-    )
+    ranked = sorted(merged.values(), key=canonical_endpoint_sort_key)
     return ranked
 
 
@@ -289,6 +302,8 @@ def derive_allowed_app_prefixes(
         if path == "/":
             return "/"
         segments = [seg for seg in path.split("/") if seg]
+        if len(segments) == 1 and "." in segments[0]:
+            return "/"
         return "/" + segments[0] if segments else "/"
 
     prefixes: List[str] = []
@@ -306,6 +321,9 @@ def derive_allowed_app_prefixes(
         if value not in seen:
             seen.add(value)
             cleaned.append(value)
+
+    if "/" in seen:
+        return ["/"]
 
     cleaned.sort(key=lambda value: (len(value), value))
     return cleaned or ["/"]
@@ -523,6 +541,7 @@ def prepare_discovered_endpoints(
         )
         for url in pruned_urls
     ]
+    discovered_endpoints = sorted(discovered_endpoints, key=canonical_endpoint_sort_key)
     log("CRAWL", f"Endpoints after pruning: {len(discovered_endpoints)}")
     return (
         discovered_endpoints,
