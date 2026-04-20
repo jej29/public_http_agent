@@ -856,6 +856,34 @@ def _classify_response_kind(request_meta: Dict[str, Any], headers_lc: Dict[str, 
     return "other"
 
 
+def _is_text_analysis_response(response_kind: str, headers_lc: Dict[str, Any], body: str) -> bool:
+    if response_kind in {"html", "json", "text", "javascript", "css"}:
+        return True
+
+    content_type = (_header_first(headers_lc, "content-type") or "").lower()
+    if any(token in content_type for token in (
+        "application/pdf",
+        "application/zip",
+        "application/octet-stream",
+        "image/",
+        "audio/",
+        "video/",
+        "font/",
+    )):
+        return False
+
+    sample = str(body or "")[:1024]
+    if not sample.strip():
+        return False
+    control_count = sum(1 for ch in sample if ord(ch) < 32 and ch not in "\r\n\t")
+    if control_count / max(len(sample), 1) > 0.02:
+        return False
+    printable_count = sum(1 for ch in sample if ch.isprintable() or ch in "\r\n\t")
+    if printable_count / max(len(sample), 1) < 0.92:
+        return False
+    return any(token in sample for token in ("<", ">", "{", "}", "[", "]", "=", ":", "/", "\\"))
+
+
 def _normalize_product_family(token: str) -> str:
     s = (token or "").lower()
     mapping = [
@@ -1683,11 +1711,12 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
     requested_url = str(request_meta.get("url") or "")
     final_url = str(snapshot.get("final_url") or requested_url or "")
     response_kind = _classify_response_kind(request_meta, headers_lc)
+    analysis_body = body if _is_text_analysis_response(response_kind, headers_lc, body) else ""
 
     try:
         fp_input = type("RespLike", (), {
             "headers": snapshot.get("headers") or {},
-            "text": body,
+            "text": analysis_body,
             "url": final_url,
             "status_code": status_code,
         })()
@@ -1702,22 +1731,22 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
     header_disclosures = _build_header_disclosures(headers_lc)
     header_version_tokens = _extract_header_version_tokens(header_disclosures)
 
-    strong_versions_raw = _find_matches(STRONG_VERSION_PATTERNS, body, 10)
-    generic_product_tokens = _find_matches(GENERIC_PRODUCT_PATTERNS, body, 10)
-    technology_tokens = _find_matches(SERVER_VERSION_PATTERNS, body, 10)
+    strong_versions_raw = _find_matches(STRONG_VERSION_PATTERNS, analysis_body, 10)
+    generic_product_tokens = _find_matches(GENERIC_PRODUCT_PATTERNS, analysis_body, 10)
+    technology_tokens = _find_matches(SERVER_VERSION_PATTERNS, analysis_body, 10)
 
-    stack_traces = _find_matches(STACK_TRACE_PATTERNS, body, 10)
-    raw_file_paths = _find_matches(FILE_PATH_PATTERNS, body, 20)
+    stack_traces = _find_matches(STACK_TRACE_PATTERNS, analysis_body, 10)
+    raw_file_paths = _find_matches(FILE_PATH_PATTERNS, analysis_body, 20)
     file_paths = _clean_file_paths(raw_file_paths, requested_url, final_url)
     local_file_paths = [p for p in file_paths if _looks_like_local_filesystem_path(p)]
-    internal_ips = _filter_meaningful_internal_ips(_find_matches(INTERNAL_IP_PATTERNS, body, 10))
-    db_errors = _find_matches(DB_ERROR_PATTERNS, body, 10)
-    runtime_error_messages = _extract_runtime_error_messages(body)
-    framework_hints = _find_matches(FRAMEWORK_HINT_PATTERNS, body, 10)
-    debug_hints = _find_matches(DEBUG_HINT_PATTERNS, body, 10)
-    directory_listing_hints = _find_matches(DIRECTORY_LISTING_PATTERNS, body, 10)
-    default_file_hints = _detect_default_file_hints(final_url, body)
-    default_error_hint = _detect_default_error_hint(body)
+    internal_ips = _filter_meaningful_internal_ips(_find_matches(INTERNAL_IP_PATTERNS, analysis_body, 10))
+    db_errors = _find_matches(DB_ERROR_PATTERNS, analysis_body, 10)
+    runtime_error_messages = _extract_runtime_error_messages(analysis_body)
+    framework_hints = _find_matches(FRAMEWORK_HINT_PATTERNS, analysis_body, 10)
+    debug_hints = _find_matches(DEBUG_HINT_PATTERNS, analysis_body, 10)
+    directory_listing_hints = _find_matches(DIRECTORY_LISTING_PATTERNS, analysis_body, 10)
+    default_file_hints = _detect_default_file_hints(final_url, analysis_body)
+    default_error_hint = _detect_default_error_hint(analysis_body)
 
     strong_version_tokens_in_body = strong_versions_raw[:]
     version_tokens_in_body = _dedup(strong_version_tokens_in_body + generic_product_tokens)[:10]
@@ -1744,11 +1773,11 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
         status_family=status_family,
     )
 
-    phpinfo_indicators = _detect_phpinfo_indicators(body)
-    phpinfo_extracted_values = _extract_phpinfo_values(body)
-    config_exposure_markers = _detect_config_exposure_markers(body)
-    log_exposure_patterns = _detect_log_exposure_patterns(body)
-    config_extracted_values = _extract_config_values(body)
+    phpinfo_indicators = _detect_phpinfo_indicators(analysis_body)
+    phpinfo_extracted_values = _extract_phpinfo_values(analysis_body)
+    config_exposure_markers = _detect_config_exposure_markers(analysis_body)
+    log_exposure_patterns = _detect_log_exposure_patterns(analysis_body)
+    config_extracted_values = _extract_config_values(analysis_body)
 
     query_param_names = _query_param_names(requested_url)
     file_path_parameter_names = [x for x in query_param_names if x.lower() in FILEISH_PARAM_NAMES]
@@ -1816,7 +1845,7 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
     hsts_missing = req_parts.scheme.lower() == "https" and not _header_first(headers_lc, "strict-transport-security")
     https_redirect_missing = req_parts.scheme.lower() == "http" and fin_parts.scheme.lower() == "http"
 
-    body_l = body.lower()
+    body_l = analysis_body.lower()
 
     document_like = any(
         tok in body_l
@@ -1885,7 +1914,7 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
         )
     )
 
-    low_signal_body = len(body.strip()) < 80
+    low_signal_body = len(analysis_body.strip()) < 80
 
     response_noise_flags = {
         "is_static_asset": response_kind == "static_asset",

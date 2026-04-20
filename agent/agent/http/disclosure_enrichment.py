@@ -1,9 +1,39 @@
 from __future__ import annotations
 
+import posixpath
+import re
 from typing import Any, Dict, List
+from urllib.parse import urlsplit
 
 from agent.detection.extractors import extract_all_signals
 from agent.detection.patterns import DisclosureSignal, DisclosureType, Severity
+
+
+LOCAL_UNIX_ROOT_HINTS = {
+    "bin",
+    "boot",
+    "dev",
+    "etc",
+    "home",
+    "lib",
+    "lib32",
+    "lib64",
+    "media",
+    "mnt",
+    "opt",
+    "proc",
+    "root",
+    "run",
+    "sbin",
+    "srv",
+    "sys",
+    "tmp",
+    "usr",
+    "var",
+    "www",
+    "app",
+    "workspace",
+}
 
 
 def _dedup(items: List[str]) -> List[str]:
@@ -67,6 +97,73 @@ def _clean_signal_evidence(items: List[str]) -> List[str]:
             continue
         out.append(value)
     return _dedup(out)
+
+
+def _normalize_url_path(url: str) -> str:
+    path = urlsplit(str(url or "")).path or "/"
+    return posixpath.normpath(path)
+
+
+def _looks_printable(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if any(ord(ch) < 32 and ch not in {"\t"} for ch in text):
+        return False
+    printable = sum(1 for ch in text if 32 <= ord(ch) <= 126)
+    if printable / max(len(text), 1) < 0.85:
+        return False
+    return bool(re.search(r"[A-Za-z0-9]", text))
+
+
+def _looks_like_local_filesystem_path(path: str) -> bool:
+    text = str(path or "").strip()
+    if re.match(r"^[A-Za-z]:\\", text):
+        return True
+    if not text.startswith("/"):
+        return False
+    first = text.strip("/").split("/", 1)[0].lower()
+    return first in LOCAL_UNIX_ROOT_HINTS
+
+
+def _is_reflected_request_path(candidate_path: str, requested_url: str, final_url: str) -> bool:
+    candidate = str(candidate_path or "").strip()
+    if not candidate.startswith("/"):
+        return False
+    candidate_norm = posixpath.normpath(candidate)
+    request_path = _normalize_url_path(requested_url)
+    final_path = _normalize_url_path(final_url)
+    request_paths = {request_path, final_path}
+    if candidate_norm in request_paths:
+        return True
+    return any(
+        path.endswith(candidate_norm)
+        or candidate_norm.endswith(path.rstrip("/") + "/")
+        for path in request_paths
+        if path and path != "/"
+    )
+
+
+def _clean_detector_file_paths(items: List[str], requested_url: str, final_url: str) -> List[str]:
+    cleaned: List[str] = []
+    for item in items or []:
+        value = str(item or "").replace("\ufffd", "").strip()
+        value = " ".join(value.split())
+        if not value or value == "/":
+            continue
+        value_l = value.lower()
+        if value_l.startswith(("http://", "https://", "//")):
+            continue
+        if "w3.org" in value_l or ".dtd" in value_l or "xhtml" in value_l:
+            continue
+        if not _looks_printable(value):
+            continue
+        if not _looks_like_local_filesystem_path(value):
+            continue
+        if _is_reflected_request_path(value, requested_url, final_url):
+            continue
+        cleaned.append(value[:200])
+    return _dedup(cleaned)
 
 
 def _is_low_value_stack_trace(items: List[str]) -> bool:
@@ -146,6 +243,30 @@ def _looks_like_setup_or_install_page(final_url: str, body_text: str) -> bool:
     return any(token in final_url_l for token in ("setup", "install", "installer", "instructions")) or any(
         token in body_l for token in ("setup", "installation", "installer", "instructions")
     )
+
+
+def _is_binary_or_static_body(feats: Dict[str, Any], snapshot: Dict[str, Any]) -> bool:
+    response_kind = str(feats.get("response_kind") or "").lower()
+    if response_kind == "static_asset":
+        return True
+
+    headers = snapshot.get("headers") or {}
+    content_type = ""
+    if isinstance(headers, dict):
+        for key, value in headers.items():
+            if str(key).lower() == "content-type":
+                content_type = str(value or "").lower()
+                break
+
+    return any(token in content_type for token in (
+        "application/pdf",
+        "application/zip",
+        "application/octet-stream",
+        "image/",
+        "audio/",
+        "video/",
+        "font/",
+    ))
 
 
 def _has_strong_config_payload(feats: Dict[str, Any]) -> bool:
@@ -291,6 +412,8 @@ def build_detector_disclosure_signals(
     info_skip: bool,
 ) -> List[Dict[str, Any]]:
     body = str(feats.get("body_text") or snapshot.get("body_text") or snapshot.get("body_snippet") or "")
+    if _is_binary_or_static_body(feats, snapshot):
+        body = ""
     headers = snapshot.get("headers") or {}
     requested_url = str(request_meta.get("url") or "")
     final_url = str(feats.get("final_url") or snapshot.get("final_url") or requested_url)
@@ -372,7 +495,9 @@ def build_detector_disclosure_signals(
         if signal.disclosure_type == DisclosureType.FILE_PATH:
             if setup_or_install_page or looks_like_phpinfo_page:
                 continue
-            evidence["file_paths"] = _dedup(signal.evidence)
+            evidence["file_paths"] = _clean_detector_file_paths(signal.evidence, requested_url, final_url)
+            if not evidence["file_paths"]:
+                continue
             out.append(
                 _build_signal(
                     signal=signal,
@@ -386,7 +511,7 @@ def build_detector_disclosure_signals(
                     scope_hint="route-specific",
                     policy_object="error_response",
                     root_cause_signature="body:file_path_exposed",
-                    cwe="CWE-497",
+                    cwe=None,
                     owasp="A05:2021 Security Misconfiguration",
                     exposed_information=evidence["file_paths"],
                     evidence=evidence,
