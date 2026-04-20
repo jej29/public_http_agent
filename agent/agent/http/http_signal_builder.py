@@ -231,7 +231,7 @@ def build_signal(
         "technology_fingerprint": technology_fingerprint,
         "template_fingerprint": template_fingerprint,
         "classification_source": "rule_based",
-        "cwe_source": "rule_based_mapping",
+        "cwe_source": "owasp_only_no_precise_cwe" if cwe is None and cwe_mapping_status else "rule_based_mapping",
         "severity_source": "rule_based_policy",
         "why_it_matters": narrative["why"],
         "recommendation": recommendation or narrative["rec"],

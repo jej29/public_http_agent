@@ -223,6 +223,7 @@ def _build_candidate(
     if candidate.get("cwe") is None and not candidate.get("cwe_mapping_status"):
         candidate["cwe_mapping_status"] = OWASP_ONLY_NO_CWE_MAPPING
         candidate["cwe_mapping_reason"] = OWASP_ONLY_NO_CWE_REASON
+        candidate["cwe_source"] = "owasp_only_no_precise_cwe"
 
     return ensure_type_cwe_consistency(candidate)
 

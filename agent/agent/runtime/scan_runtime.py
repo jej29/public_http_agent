@@ -989,8 +989,12 @@ def _normalize_type_cwe_consistency(candidate: Dict[str, Any]) -> Dict[str, Any]
             candidate["cwe"] = "CWE-532"
 
     elif ctype == "FILE_PATH_HANDLING_ANOMALY":
-        if cwe not in {"CWE-497", None}:
-            candidate["cwe"] = "CWE-497"
+        candidate.pop("cwe", None)
+        candidate["cwe_mapping_status"] = OWASP_ONLY_NO_CWE_MAPPING
+        candidate["cwe_mapping_reason"] = (
+            "OWASP category is applicable, but no precise single CWE mapping is used for this file/path handling signal."
+        )
+        candidate["cwe_source"] = "owasp_only_no_precise_cwe"
 
     elif ctype == "CORS_MISCONFIG":
         candidate["cwe"] = "CWE-942"
@@ -1254,6 +1258,7 @@ async def llm_judge_if_enabled(candidate: Dict[str, Any], snapshot: Dict[str, An
 
     if judged.get("severity") in {"Info", "Low", "Medium", "High"}:
         candidate["severity"] = judged["severity"]
+        candidate["severity_source"] = "llm_judge"
     else:
         candidate["severity"] = original_severity
 
@@ -1265,7 +1270,7 @@ async def llm_judge_if_enabled(candidate: Dict[str, Any], snapshot: Dict[str, An
         "HTTP_CONFIG_FILE_EXPOSURE": {"CWE-538", None},
         "PHPINFO_EXPOSURE": {"CWE-497", None},
         "LOG_VIEWER_EXPOSURE": {"CWE-532", None},
-        "FILE_PATH_HANDLING_ANOMALY": {"CWE-497", None},
+        "FILE_PATH_HANDLING_ANOMALY": {None},
         "CORS_MISCONFIG": {"CWE-942"},
         "COOKIE_HTTPONLY_MISSING": {"CWE-1004"},
         "COOKIE_SECURE_MISSING": {"CWE-614"},
@@ -1283,9 +1288,12 @@ async def llm_judge_if_enabled(candidate: Dict[str, Any], snapshot: Dict[str, An
     if allowed is None:
         if judged_cwe is not None or "cwe" in judged:
             candidate["cwe"] = judged_cwe
+            candidate["cwe_source"] = "llm_judge_mapping" if judged_cwe else "owasp_only_no_precise_cwe"
     else:
         if judged_cwe in allowed:
             candidate["cwe"] = judged_cwe
+            if "cwe" in judged:
+                candidate["cwe_source"] = "llm_judge_mapping" if judged_cwe else "owasp_only_no_precise_cwe"
         else:
             candidate["cwe"] = original_cwe
 
@@ -1590,6 +1598,8 @@ async def llm_judge_if_enabled(candidate: Dict[str, Any], snapshot: Dict[str, An
 
     if judged.get("cwe_mapping_status") is not None:
         candidate["cwe_mapping_status"] = judged["cwe_mapping_status"]
+        if not candidate.get("cwe"):
+            candidate["cwe_source"] = "owasp_only_no_precise_cwe"
 
     if judged.get("cwe_mapping_reason") is not None:
         candidate["cwe_mapping_reason"] = judged["cwe_mapping_reason"]
@@ -1604,6 +1614,8 @@ async def llm_judge_if_enabled(candidate: Dict[str, Any], snapshot: Dict[str, An
         candidate[k] = v
 
     candidate = _normalize_type_cwe_consistency(candidate)
+    if candidate.get("cwe_mapping_status") == OWASP_ONLY_NO_CWE_MAPPING and not candidate.get("cwe"):
+        candidate["cwe_source"] = candidate.get("cwe_source") or "owasp_only_no_precise_cwe"
     return candidate
 
 

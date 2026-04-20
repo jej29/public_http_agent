@@ -84,7 +84,7 @@ PRIMARY_CWE_BY_TYPE: Dict[str, Optional[str]] = {
     "HTTP_CONFIG_FILE_EXPOSED": None,  # backward-compat typo guard
     "HTTP_CONFIG_FILE_EXPOSURE": "CWE-538",
     "LOG_VIEWER_EXPOSURE": "CWE-532",
-    "FILE_PATH_HANDLING_ANOMALY": "CWE-497",
+    "FILE_PATH_HANDLING_ANOMALY": None,
     "CORS_MISCONFIG": "CWE-942",
     "COOKIE_HTTPONLY_MISSING": "CWE-1004",
     "COOKIE_SECURE_MISSING": "CWE-614",
@@ -114,7 +114,6 @@ ALLOWED_PRIMARY_CWES = {
     "CWE-942",
     "CWE-1004",
     "CWE-614",
-    "CWE-200",
     "CWE-601",
     None,
 }
@@ -159,4 +158,5 @@ def ensure_type_cwe_consistency(candidate: Dict[str, object]) -> Dict[str, objec
         if not candidate.get("cwe"):
             candidate["cwe_mapping_status"] = OWASP_ONLY_NO_CWE_MAPPING
             candidate["cwe_mapping_reason"] = OWASP_ONLY_NO_CWE_REASON
+            candidate["cwe_source"] = "owasp_only_no_precise_cwe"
     return candidate

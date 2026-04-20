@@ -789,13 +789,17 @@ def build_file_path_handling_signal(
             exposed_information=evidence_exposed,
             leak_type="file_path_parameter",
             leak_value=",".join(fileish_params),
-            cwe="CWE-200",
+            cwe=None,
             owasp="A05:2021 Security Misconfiguration",
             scope_hint="route-specific",
             policy_object="file_path_parameter",
             root_cause_signature=f"file_path_param:{','.join(sorted(fileish_params))}",
             technology_fingerprint=feats.get("technology_fingerprint") or [],
             template_fingerprint=template_fingerprint,
+            cwe_mapping_status="OWASP_ONLY_NO_CWE_MAPPING",
+            cwe_mapping_reason=(
+                "OWASP category is applicable, but no precise single CWE mapping is used for this file/path handling signal."
+            ),
         )
     ]
 
