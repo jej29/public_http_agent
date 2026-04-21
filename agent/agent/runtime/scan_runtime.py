@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlparse, urlsplit
@@ -142,6 +143,7 @@ async def _run_plan_and_merge(
     false_positive_map: Dict[str, Dict[str, Any]],
     request_failures: List[Dict[str, Any]],
     shared_unhealthy_scopes: set[str] | None = None,
+    auth_deadline_monotonic: float | None = None,
 ) -> int:
     process_result = await process_plan(
         client=client,
@@ -160,6 +162,7 @@ async def _run_plan_and_merge(
         update_cookie_observation_fn=update_cookie_observation,
         request_auth_state="authenticated" if authenticated else "anonymous",
         shared_unhealthy_scopes=shared_unhealthy_scopes,
+        auth_deadline_monotonic=auth_deadline_monotonic,
     )
 
     _merge_process_result(
@@ -429,6 +432,7 @@ async def _run_authenticated_business_probes(
     seq_start: int,
     shared_unhealthy_scopes: set[str] | None = None,
     probe_metadata: List[Dict[str, Any]] | None = None,
+    auth_deadline_monotonic: float | None = None,
 ) -> int:
     if not authenticated:
         return seq_start
@@ -498,6 +502,7 @@ async def _run_authenticated_business_probes(
         false_positive_map=false_positive_map,
         request_failures=request_failures,
         shared_unhealthy_scopes=shared_unhealthy_scopes,
+        auth_deadline_monotonic=auth_deadline_monotonic,
     )
 
 
@@ -2478,6 +2483,15 @@ async def run_scan(
     http_only_mode = os.getenv("HTTP_ONLY_MODE", "false").lower() == "true"
     #enable_auth_business_probe = os.getenv("ENABLE_AUTHENTICATED_BUSINESS_PROBE", "off").lower() == "on"
     enable_auth_business_probe = os.getenv("ENABLE_AUTHENTICATED_BUSINESS_PROBE", "on").lower() == "on"
+    try:
+        auth_session_budget_seconds = float(os.getenv("AUTH_SESSION_BUDGET_SECONDS", "0") or "0")
+    except ValueError:
+        auth_session_budget_seconds = 0.0
+    auth_deadline_monotonic = (
+        time.monotonic() + auth_session_budget_seconds
+        if auth_session_budget_seconds > 0
+        else None
+    )
 
     run_id = run_id_utc()
     requested_out = Path(out_file)
@@ -2561,6 +2575,9 @@ async def run_scan(
                         "AUTHENTICATED_BUSINESS_PROBE_MAX_PER_CATEGORY", ""
                     ),
                     "access_control_replay_max_targets": os.getenv("ACCESS_CONTROL_REPLAY_MAX_TARGETS", "20"),
+                    "auth_session_budget_seconds": os.getenv("AUTH_SESSION_BUDGET_SECONDS", "0"),
+                    "auth_probe_batch_size": os.getenv("AUTH_PROBE_BATCH_SIZE", ""),
+                    "shape_sensitive_get_error_threshold": os.getenv("SHAPE_SENSITIVE_GET_ERROR_THRESHOLD", "3"),
                 },
             },
             "summary": {},
@@ -2767,6 +2784,7 @@ async def run_scan(
                 seq_start=next_seq,
                 shared_unhealthy_scopes=shared_unhealthy_scopes,
                 probe_metadata=authenticated_business_probe_targets,
+                auth_deadline_monotonic=auth_deadline_monotonic,
             )
         elif authenticated and http_only_mode:
             log("AUTH", "Authenticated business probes skipped: HTTP_ONLY_MODE=true")
@@ -2824,6 +2842,7 @@ async def run_scan(
             false_positive_map=false_positive_map,
             request_failures=request_failures,
             shared_unhealthy_scopes=shared_unhealthy_scopes,
+            auth_deadline_monotonic=auth_deadline_monotonic,
         )
 
         async def _run_llm_planner_round(round_name: str, seq_start_val: int) -> int:
@@ -2870,6 +2889,7 @@ async def run_scan(
                 false_positive_map=false_positive_map,
                 request_failures=request_failures,
                 shared_unhealthy_scopes=shared_unhealthy_scopes,
+                auth_deadline_monotonic=auth_deadline_monotonic,
             )
 
         if llm_planner_enabled:
@@ -2890,6 +2910,7 @@ async def run_scan(
             false_positive_map=false_positive_map,
             request_failures=request_failures,
             shared_unhealthy_scopes=shared_unhealthy_scopes,
+            auth_deadline_monotonic=auth_deadline_monotonic,
         )
 
         if llm_planner_enabled:

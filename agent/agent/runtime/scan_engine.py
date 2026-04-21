@@ -1691,6 +1691,7 @@ async def process_plan(
     update_cookie_observation_fn,
     request_auth_state: str = "inherit",
     shared_unhealthy_scopes: set[str] | None = None,
+    auth_deadline_monotonic: float | None = None,
 ) -> Dict[str, Any]:
     confirmed_map: Dict[str, Dict[str, Any]] = {}
     informational_map: Dict[str, Dict[str, Any]] = {}
@@ -1701,6 +1702,23 @@ async def process_plan(
     seq = seq_start
     raw_dir = run_dir / "raw"
     batch_size = int(os.getenv("SCAN_BATCH_SIZE", os.getenv("CONCURRENCY", "6")))
+    if str(request_auth_state or "").strip().lower() == "authenticated":
+        auth_batch_override = os.getenv("AUTH_PROBE_BATCH_SIZE", "").strip()
+        if auth_batch_override:
+            try:
+                batch_size = max(1, int(auth_batch_override))
+            except ValueError:
+                pass
+    try:
+        auth_session_budget_seconds = float(os.getenv("AUTH_SESSION_BUDGET_SECONDS", "0") or "0")
+    except ValueError:
+        auth_session_budget_seconds = 0.0
+    auth_started_at = time.monotonic()
+    auth_budget_exhausted = False
+    try:
+        shape_sensitive_error_threshold = int(os.getenv("SHAPE_SENSITIVE_GET_ERROR_THRESHOLD", "3"))
+    except ValueError:
+        shape_sensitive_error_threshold = 3
     unhealthy_scopes = shared_unhealthy_scopes if shared_unhealthy_scopes is not None else set()
 
     log_fn("SCAN", f"[process_plan-config] batch_size={batch_size} timeout_s={timeout_s} retries={retries}")
@@ -1722,6 +1740,9 @@ async def process_plan(
             "auth_failure_count": 0,
             "auth_unhealthy": False,
             "auth_failure_examples": [],
+            "shape_sensitive_get_errors": 0,
+            "shape_sensitive_examples": [],
+            "shape_sensitive_unhealthy": False,
         }
 
     def _effective_auth_state(spec: Any) -> str:
@@ -2045,10 +2066,15 @@ async def process_plan(
             if int(scope_state.get("auth_failure_count", 0)) > 0:
                 scope_state["auth_unhealthy"] = True
 
-        if not scope_state.get("baseline_unhealthy") and not scope_state.get("auth_unhealthy"):
+        if (
+            not scope_state.get("baseline_unhealthy")
+            and not scope_state.get("auth_unhealthy")
+            and not scope_state.get("shape_sensitive_unhealthy")
+        ):
             return False, ""
 
         family = str(getattr(spec, "family", "") or "").strip().lower()
+        method = str(getattr(spec, "method", "") or "").strip().upper()
 
         skip_families = {
             "baseline",
@@ -2061,7 +2087,66 @@ async def process_plan(
         if family in skip_families:
             return True, "auth_unhealthy_scope" if scope_state.get("auth_unhealthy") else "baseline_unhealthy_scope"
 
+        if scope_state.get("shape_sensitive_unhealthy") and family in {"error_path", "error_query", "header_behavior"}:
+            return True, "shape_sensitive_get_unhealthy_scope"
+        if scope_state.get("shape_sensitive_unhealthy") and family == "authenticated_business_probe" and method == "GET":
+            return True, "shape_sensitive_get_unhealthy_scope"
+
         return False, ""
+
+    def _shape_sensitive_action_score(url: str) -> int:
+        path_l = (urlsplit(str(url or "")).path or "").lower()
+        score = 0
+        for token in (
+            "upload", "download", "excel", "export", "import", "update",
+            "delete", "create", "insert", "submit", "save", "approval",
+        ):
+            if token in path_l:
+                score += 1
+        return score
+
+    def _update_shape_sensitive_health(
+        *,
+        scope_state: Dict[str, Any],
+        scope_key: str,
+        spec: Any,
+        snap: Dict[str, Any],
+        raw_path: str,
+    ) -> None:
+        if shape_sensitive_error_threshold <= 0:
+            return
+        method = str(getattr(spec, "method", "") or "").strip().upper()
+        if method != "GET":
+            return
+        status_code = snap.get("status_code")
+        if status_code not in {400, 405, 415, 422, 500}:
+            return
+        if _shape_sensitive_action_score(str(getattr(spec, "url", "") or "")) <= 0:
+            return
+
+        scope_state["shape_sensitive_get_errors"] = int(scope_state.get("shape_sensitive_get_errors", 0)) + 1
+        examples = scope_state.setdefault("shape_sensitive_examples", [])
+        if len(examples) < 5:
+            examples.append(
+                {
+                    "name": str(getattr(spec, "name", "") or ""),
+                    "method": method,
+                    "url": str(getattr(spec, "url", "") or ""),
+                    "status_code": status_code,
+                    "raw_ref": raw_path,
+                }
+            )
+
+        if not scope_state.get("shape_sensitive_unhealthy") and int(scope_state.get("shape_sensitive_get_errors", 0)) >= shape_sensitive_error_threshold:
+            scope_state["shape_sensitive_unhealthy"] = True
+            log_fn(
+                "SCAN",
+                "[scope-shape-sensitive-get-unhealthy] "
+                f"scope_key={scope_key} "
+                f"errors={scope_state.get('shape_sensitive_get_errors')} "
+                f"threshold={shape_sensitive_error_threshold} "
+                f"examples={scope_state.get('shape_sensitive_examples')}"
+            )
 
     async def run_one(idx: int, spec: Any) -> Dict[str, Any]:
         scope_key = probe_scope_key(spec)
@@ -2180,6 +2265,23 @@ async def process_plan(
         }
 
     for batch_start in range(0, len(plan), batch_size):
+        if str(request_auth_state or "").strip().lower() == "authenticated":
+            now = time.monotonic()
+            deadline_exceeded = bool(auth_deadline_monotonic is not None and now >= auth_deadline_monotonic)
+            elapsed = now - auth_started_at
+            local_budget_exceeded = bool(auth_session_budget_seconds > 0 and elapsed >= auth_session_budget_seconds)
+            if deadline_exceeded or local_budget_exceeded:
+                auth_budget_exhausted = True
+                log_fn(
+                    "AUTH",
+                    "[auth-session-budget-exhausted] "
+                    f"elapsed_s={elapsed:.1f} "
+                    f"budget_s={auth_session_budget_seconds:.1f} "
+                    f"deadline_exceeded={deadline_exceeded} "
+                    f"remaining_specs={max(0, len(plan) - batch_start)}"
+                )
+                break
+
         batch_specs = plan[batch_start: batch_start + batch_size]
         tasks = [
             run_one(batch_start + offset + 1, spec)
@@ -2237,6 +2339,13 @@ async def process_plan(
                 scope_key=scope_key,
                 spec=spec,
                 snap=snap,
+            )
+            _update_shape_sensitive_health(
+                scope_state=scope_state,
+                scope_key=scope_key,
+                spec=spec,
+                snap=snap,
+                raw_path=str(raw_path),
             )
 
             snap_headers = snap.get("headers") or {}
@@ -2398,4 +2507,5 @@ async def process_plan(
         "false_positive_map": false_positive_map,
         "request_failures": request_failures,
         "next_seq": seq,
+        "auth_session_budget_exhausted": auth_budget_exhausted,
     }
