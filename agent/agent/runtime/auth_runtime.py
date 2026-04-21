@@ -18,6 +18,15 @@ from agent.http.http_session import clear_cookie_name_from_client, preferred_coo
 from agent.runtime.discovery_planning import normalize_target_name, same_origin
 
 
+def split_manual_auth_header_chunks(raw: str) -> List[str]:
+    raw = str(raw or "").strip()
+    if not raw:
+        return []
+    if "|||" in raw:
+        return [piece.strip() for piece in raw.split("|||") if piece.strip()]
+    return [piece.strip() for piece in raw.replace("\r\n", "\n").split("\n") if piece.strip()]
+
+
 def build_effective_seed_urls(
     *,
     target: str,
@@ -116,7 +125,7 @@ def apply_manual_auth_to_client(
             applied_cookie_names.append(cookie_name)
 
     if manual_headers_raw:
-        for chunk in manual_headers_raw.split("|||"):
+        for chunk in split_manual_auth_header_chunks(manual_headers_raw):
             piece = str(chunk or "").strip()
             if not piece or ":" not in piece:
                 continue

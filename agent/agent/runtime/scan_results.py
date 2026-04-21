@@ -721,6 +721,78 @@ def _build_scan_diagnostics(
     }
 
 
+def _error_response_marker_summary(body: str) -> Dict[str, Any]:
+    text = str(body or "")
+    lower = text.lower()
+    oracle = re.findall(r"\bORA-\d{5}\b", text, flags=re.I)
+    sql_markers = [
+        marker
+        for marker in (
+            "sql",
+            "sqlexception",
+            "preparedstatement",
+            "constraint",
+            "jdbc",
+            "hibernate",
+            "mybatis",
+            "psqlexception",
+            "mysql",
+            "postgres",
+            "oracle",
+        )
+        if marker in lower
+    ]
+    stack_markers = [
+        marker
+        for marker in ("exception", "stack trace", "traceback", "caused by", "\tat ", "java.")
+        if marker in lower
+    ]
+    return {
+        "has_db_error_markers": bool(oracle or sql_markers),
+        "has_stack_markers": bool(stack_markers),
+        "oracle_error_codes": sorted(set(oracle)),
+        "db_error_markers": sorted(set(sql_markers)),
+        "stack_markers": sorted(set(stack_markers)),
+    }
+
+
+def _build_error_response_debug(raw_index: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for item in raw_index or []:
+        try:
+            status_code = int(item.get("status_code") or 0)
+        except Exception:
+            continue
+        if status_code < 500:
+            continue
+
+        body = str(item.get("body_text") or item.get("body_snippet") or "")
+        marker_summary = _error_response_marker_summary(body)
+        if marker_summary["has_db_error_markers"] or marker_summary["has_stack_markers"]:
+            classification_hint = "error_disclosure_candidate"
+        elif body:
+            classification_hint = "generic_error_response_no_sensitive_markers"
+        else:
+            classification_hint = "empty_error_response"
+
+        out.append(
+            {
+                "request_name": item.get("request_name"),
+                "method": item.get("method"),
+                "url": item.get("url"),
+                "status_code": status_code,
+                "content_type": item.get("content_type"),
+                "family": item.get("family"),
+                "auth_state": item.get("auth_state"),
+                "raw_ref": item.get("raw_ref"),
+                "classification_hint": classification_hint,
+                **marker_summary,
+                "body_preview": body[:500],
+            }
+        )
+    return out[:500]
+
+
 def finalize_and_write_results(
     *,
     results: Dict[str, Any],
@@ -865,6 +937,13 @@ def finalize_and_write_results(
         json.dumps(scan_diagnostics, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    error_response_debug = _build_error_response_debug(raw_index)
+    if error_response_debug:
+        error_response_debug_path = run_dir / "debug" / "error_responses.json"
+        error_response_debug_path.write_text(
+            json.dumps(error_response_debug, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     candidate_signal_path = run_dir / "debug" / "candidate_signals.json"
     candidate_signal_path.parent.mkdir(parents=True, exist_ok=True)
     candidate_signal_path.write_text(

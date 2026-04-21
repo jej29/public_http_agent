@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 
 from agent.runtime.scan_runtime import (
     build_auth_args,
@@ -45,7 +46,22 @@ def main() -> None:
         help="Password for optional pre-authentication",
     )
 
+    parser.add_argument(
+        "--manual-auth-cookie",
+        help="Manual Cookie header value to replay authenticated sessions.",
+    )
+
+    parser.add_argument(
+        "--manual-auth-headers",
+        help="Manual auth headers. Supports newline-separated 'Name: value' lines or '|||' separators.",
+    )
+
     args = parser.parse_args()
+
+    if args.manual_auth_cookie:
+        os.environ["MANUAL_AUTH_COOKIE"] = args.manual_auth_cookie
+    if args.manual_auth_headers:
+        os.environ["MANUAL_AUTH_HEADERS"] = args.manual_auth_headers
 
     auth = build_auth_args(args)
     target_name = resolve_target_name(args.target, args.target_name)

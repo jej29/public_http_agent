@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit, urlencode
 from agent.core.scope import normalize_url_for_dedup
 from agent.core.common import log
+from agent.runtime.auth_runtime import split_manual_auth_header_chunks
 
 def rand_suffix(n: int = 8) -> str:
     alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -73,7 +74,7 @@ def _manual_auth_header_overrides() -> Dict[str, str]:
     if not raw:
         return out
 
-    for chunk in raw.split("|||"):
+    for chunk in split_manual_auth_header_chunks(raw):
         piece = str(chunk or "").strip()
         if not piece or ":" not in piece:
             continue
@@ -959,16 +960,20 @@ def _notfound_specs(base: str, headers: Dict[str, str]) -> List[RequestSpec]:
     ]
 
 def _risky_method_specs(target_url: str, headers: Dict[str, str]) -> List[RequestSpec]:
-    if os.getenv("ENABLE_RISKY_METHOD_PROBES", "off").lower() != "on":
-        return []
-
     methods = [
         ("OPTIONS", "options_probe"),
-        ("TRACE", "unsafe_method_probe"),
-        ("PUT", "unsafe_method_probe"),
-        ("DELETE", "unsafe_method_probe"),
-        ("PATCH", "unsafe_method_probe"),
+        ("PROPFIND", "safe_extended_method_probe"),
     ]
+
+    if os.getenv("ENABLE_RISKY_METHOD_PROBES", "off").lower() == "on":
+        methods.extend(
+            [
+                ("TRACE", "unsafe_method_probe"),
+                ("PATCH", "unsafe_method_probe"),
+                ("PUT", "unsafe_method_probe"),
+                ("DELETE", "unsafe_method_probe"),
+            ]
+        )
 
     return [
         RequestSpec(

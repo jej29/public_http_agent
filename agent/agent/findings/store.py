@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlsplit
@@ -193,6 +195,141 @@ def save_json(path: Path, data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(prune_empty(data), indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+_SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+    "x-api-key",
+    "x-auth-token",
+    "x-access-token",
+}
+
+_SENSITIVE_BODY_FIELD_NAMES = {
+    "access_token",
+    "auth",
+    "authorization",
+    "id_token",
+    "jwt",
+    "password",
+    "refresh_token",
+    "secret",
+    "session",
+    "token",
+}
+
+
+def _redact_cookie_header(value: Any) -> str:
+    chunks = []
+    for part in str(value or "").split(";"):
+        piece = part.strip()
+        if not piece:
+            continue
+        if "=" not in piece:
+            chunks.append(piece)
+            continue
+        name, _value = piece.split("=", 1)
+        chunks.append(f"{name.strip()}=<redacted>")
+    return "; ".join(chunks) if chunks else "<redacted>"
+
+
+def _redact_set_cookie_header(value: Any) -> str:
+    raw = str(value or "")
+    if not raw.strip() or "=" not in raw:
+        return "<redacted>"
+    first, *attrs = raw.split(";")
+    name = first.split("=", 1)[0].strip()
+    suffix = "".join(f";{attr}" for attr in attrs)
+    return f"{name}=<redacted>{suffix}"
+
+
+def _redact_header_value(name: Any, value: Any) -> Any:
+    key = str(name or "").strip().lower()
+    if key == "cookie":
+        return _redact_cookie_header(value)
+    if key == "set-cookie":
+        if isinstance(value, list):
+            return [_redact_set_cookie_header(item) for item in value]
+        return _redact_set_cookie_header(value)
+    if key in _SENSITIVE_HEADER_NAMES:
+        return "<redacted>"
+    return value
+
+
+def _redact_headers(headers: Any) -> Any:
+    if not isinstance(headers, dict):
+        return headers
+    return {key: _redact_header_value(key, value) for key, value in headers.items()}
+
+
+def _redact_request_body_text(value: Any) -> Any:
+    if value is None:
+        return value
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+    for field in _SENSITIVE_BODY_FIELD_NAMES:
+        text = re.sub(
+            rf"(?i)([?&;\s]|^)({re.escape(field)})(=)([^&;\s]+)",
+            rf"\1\2\3<redacted>",
+            text,
+        )
+        text = re.sub(
+            rf'(?i)("{re.escape(field)}"\s*:\s*")([^"]*)(")',
+            rf'\1<redacted>\3',
+            text,
+        )
+    return text
+
+
+def _redact_request_like_block(block: Any) -> Any:
+    if not isinstance(block, dict):
+        return block
+    out = dict(block)
+    out["headers"] = _redact_headers(out.get("headers") or {})
+    for key in ("body", "body_text"):
+        if key in out:
+            out[key] = _redact_request_body_text(out.get(key))
+    return out
+
+
+def _redact_set_cookie_objects(value: Any) -> Any:
+    if not isinstance(value, list):
+        return value
+    redacted = []
+    for item in value:
+        if isinstance(item, dict):
+            safe = dict(item)
+            if "raw" in safe:
+                safe["raw"] = _redact_set_cookie_header(safe.get("raw"))
+            if "value" in safe:
+                safe["value"] = "<redacted>"
+            redacted.append(safe)
+        elif isinstance(item, str):
+            redacted.append(_redact_set_cookie_header(item))
+        else:
+            redacted.append(item)
+    return redacted
+
+
+def _redact_raw_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    safe = dict(snapshot or {})
+    safe["headers"] = _redact_headers(safe.get("headers") or {})
+    safe["request"] = _redact_request_like_block(safe.get("request") or {})
+    safe["actual_request"] = _redact_request_like_block(safe.get("actual_request") or {})
+    safe["set_cookie_objects"] = _redact_set_cookie_objects(safe.get("set_cookie_objects") or [])
+
+    redirect_chain = []
+    for hop in safe.get("redirect_chain") or []:
+        if not isinstance(hop, dict):
+            redirect_chain.append(hop)
+            continue
+        hop_safe = dict(hop)
+        hop_safe["headers"] = _redact_headers(hop_safe.get("headers") or {})
+        redirect_chain.append(hop_safe)
+    if redirect_chain:
+        safe["redirect_chain"] = redirect_chain
+    return safe
+
+
 def save_raw_capture(raw_dir: Path, seq: int, spec: Any, snapshot: Dict[str, Any]) -> Path:
     filename = f"{seq:04d}_{spec.name}.json"
     path = raw_dir / filename
@@ -221,9 +358,17 @@ def save_raw_capture(raw_dir: Path, seq: int, spec: Any, snapshot: Dict[str, Any
     if request_block["body"] is None and spec.body:
         request_block["body"] = spec.body.decode("utf-8", errors="replace")
 
+    redact_raw_secrets = os.getenv("RAW_CAPTURE_REDACT_SECRETS", "off").lower() == "on"
+    if redact_raw_secrets:
+        request_payload = _redact_request_like_block(request_block)
+        response_payload = _redact_raw_snapshot(snapshot)
+    else:
+        request_payload = request_block
+        response_payload = snapshot
+
     data = {
-        "request": request_block,
-        "response": snapshot,
+        "request": request_payload,
+        "response": response_payload,
     }
     save_json(path, data)
     return path
