@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit, urlencode
 from agent.core.scope import normalize_url_for_dedup
 from agent.core.common import log
-from agent.runtime.auth_runtime import split_manual_auth_header_chunks
+from agent.runtime.manual_auth import split_manual_auth_header_chunks
 
 def rand_suffix(n: int = 8) -> str:
     alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"

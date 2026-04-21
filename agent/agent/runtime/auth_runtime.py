@@ -16,15 +16,7 @@ from agent.crawler import (
 )
 from agent.http.http_session import clear_cookie_name_from_client, preferred_cookie_path_for_url
 from agent.runtime.discovery_planning import normalize_target_name, same_origin
-
-
-def split_manual_auth_header_chunks(raw: str) -> List[str]:
-    raw = str(raw or "").strip()
-    if not raw:
-        return []
-    if "|||" in raw:
-        return [piece.strip() for piece in raw.split("|||") if piece.strip()]
-    return [piece.strip() for piece in raw.replace("\r\n", "\n").split("\n") if piece.strip()]
+from agent.runtime.manual_auth import split_manual_auth_header_chunks
 
 
 def build_effective_seed_urls(
