@@ -2731,6 +2731,44 @@ def build_authenticated_business_probe_plan(
             return True
         return False
 
+    def _is_api_like(url: str) -> bool:
+        path = _path(url).lower()
+        return any(token in path for token in ("/api/", "/rest/", "/graphql", "/v1/", "/v2/"))
+
+    def _shape_sensitive_action_score(url: str) -> int:
+        path = _path(url).lower()
+        action_tokens = (
+            "upload",
+            "download",
+            "excel",
+            "export",
+            "import",
+            "update",
+            "delete",
+            "create",
+            "submit",
+            "save",
+            "issue",
+            "approval",
+        )
+        return sum(1 for token in action_tokens if token in path)
+
+    def _is_user_context_path(url: str) -> bool:
+        path = _path(url).lower()
+        return any(
+            token in path
+            for token in (
+                "/me",
+                "/my",
+                "/profile",
+                "/account",
+                "/member",
+                "/student",
+                "/faculty",
+                "/user",
+            )
+        )
+
     def _business_category(url: str, ep: Dict[str, object]) -> str:
         path = _path(url).lower()
         query_keys = _query_keys(url)
@@ -2740,10 +2778,12 @@ def build_authenticated_business_probe_plan(
             "backup", "log", "server-status", "server-info", "setup",
         )):
             return "diagnostic_or_config"
+        if _is_api_like(url):
+            if _shape_sensitive_action_score(url) > 0 and not query_keys and not _objectish(url):
+                return "api_shape_sensitive"
+            return "api"
         if any(token in path for token in ("/admin", "/manage", "/console", "/dashboard")):
             return "admin"
-        if any(token in path for token in ("/api/", "/rest/", "/graphql")):
-            return "api"
         if any(token in path for token in ("/upload", "/uploads", "/file", "/files", "/download", "/documents")):
             return "file_or_upload"
         if _objectish(url) or query_keys.intersection({
@@ -2811,6 +2851,16 @@ def build_authenticated_business_probe_plan(
         elif _request_replay_has_id_like_signal(url):
             score += 8
 
+        action_score = _shape_sensitive_action_score(url)
+        if action_score:
+            if _is_api_like(url) and not qkeys and not _objectish(url):
+                score -= min(18, 7 + (action_score * 3))
+            else:
+                score -= min(8, action_score * 2)
+
+        if _is_user_context_path(url):
+            score += 5
+
         if qkeys.intersection({
             "id", "userid", "user_id", "accountid", "account_id",
             "orderid", "order_id", "cardid", "card_id", "addressid",
@@ -2833,7 +2883,12 @@ def build_authenticated_business_probe_plan(
         if _publicish_path_score(url) > 0 and _sensitive_path_score(url) == 0 and not _objectish(url):
             return -999
 
-        if _sensitive_path_score(url) == 0 and not _objectish(url) and not qkeys:
+        if (
+            _sensitive_path_score(url) == 0
+            and not _objectish(url)
+            and not qkeys
+            and not _is_user_context_path(url)
+        ):
             return -999
 
         return score
@@ -2902,13 +2957,18 @@ def build_authenticated_business_probe_plan(
 
     if len(selected) < max_targets:
         selected_keys = {_normalize_replay_key(url) for _, _, url, _ in selected}
-        for item in ranked:
-            _priority, _category, url, _ep = item
-            norm_key = _normalize_replay_key(url)
-            if norm_key in selected_keys:
-                continue
-            selected.append(item)
-            selected_keys.add(norm_key)
+        for allow_shape_sensitive_overflow in (False, True):
+            for item in ranked:
+                _priority, category, url, _ep = item
+                if category == "api_shape_sensitive" and not allow_shape_sensitive_overflow:
+                    continue
+                norm_key = _normalize_replay_key(url)
+                if norm_key in selected_keys:
+                    continue
+                selected.append(item)
+                selected_keys.add(norm_key)
+                if len(selected) >= max_targets:
+                    break
             if len(selected) >= max_targets:
                 break
 

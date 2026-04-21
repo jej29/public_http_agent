@@ -37,6 +37,7 @@ from agent.planning.probes import (
     build_authenticated_business_probe_plan,
 )
 from agent.reporting.report_generator import generate_reports
+from agent.runtime.cookie_diagnostics import raw_index_cookie_observation_fields
 from agent.runtime.scan_summary import (
     add_confirmed_counts_to_coverage,
     compute_summary,
@@ -325,6 +326,7 @@ async def _process_auth_snapshots(
                 "replay_priority": getattr(spec, "replay_priority", None),
                 "expected_signal": getattr(spec, "expected_signal", None),
                 "mutation_class": getattr(spec, "mutation_class", None),
+                **raw_index_cookie_observation_fields(snap),
             }
         )
         seq += 1
@@ -624,6 +626,7 @@ async def _run_information_disclosure_differential_replay(
                     "request_body_len": 0,
                     "request_body_present": False,
                     "request_body_text": "",
+                    **raw_index_cookie_observation_fields(snapshot),
                 }
             )
 
@@ -2001,6 +2004,8 @@ def _build_replay_raw_index_entry(
         "request_headers": dict(spec.headers or {}),
         "request_body_len": len(request_body_text),
         "request_body_present": bool(request_body_text),
+        "request_body_text": request_body_text,
+        **raw_index_cookie_observation_fields(snapshot),
     }
 
 

@@ -18,6 +18,7 @@ from agent.runtime.candidate_finalizer import (
 from agent.runtime.candidate_verifier import reproduce_verify
 from agent.core.common import log
 from agent.findings.store import merge_finding, save_raw_capture, seed_bucket_candidate
+from agent.runtime.cookie_diagnostics import raw_index_cookie_observation_fields
 from agent.http.http_session import (
     clear_cookie_name_from_client,
     cookie_jar_delta,
@@ -1849,6 +1850,7 @@ async def process_plan(
                 "request_body_len": req_shape["body_len"],
                 "request_body_present": req_shape["has_body"],
                 "request_body_text": req_shape["body_text"],   # Added for replay diagnostics.
+                **raw_index_cookie_observation_fields(snap),
             }
         )
 

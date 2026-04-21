@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlsplit
@@ -457,6 +458,269 @@ def store_verified_findings(
         )
 
 
+def _count_values(items: List[Dict[str, Any]], field: str, *, limit: int = 20) -> Dict[str, int]:
+    counts = Counter()
+    for item in items or []:
+        value = item.get(field)
+        if value is None or value == "":
+            value = "<missing>"
+        counts[str(value)] += 1
+    return dict(counts.most_common(limit))
+
+
+def _status_family(status: Any) -> str:
+    try:
+        code = int(status)
+    except Exception:
+        return "unknown"
+    if code < 100:
+        return "unknown"
+    return f"{code // 100}xx"
+
+
+def _content_family(content_type: Any) -> str:
+    value = str(content_type or "").lower()
+    if not value:
+        return "unknown"
+    if "json" in value:
+        return "json"
+    if "html" in value:
+        return "html"
+    if "javascript" in value or "ecmascript" in value:
+        return "javascript"
+    if "xml" in value:
+        return "xml"
+    if value.startswith("text/"):
+        return "text"
+    if any(token in value for token in ("image/", "font/", "video/", "audio/", "pdf", "zip", "octet-stream")):
+        return "binary_or_static"
+    return value.split(";", 1)[0]
+
+
+def _path_tokens(url: str) -> List[str]:
+    try:
+        return [seg.lower() for seg in (urlsplit(str(url or "")).path or "/").split("/") if seg]
+    except Exception:
+        return []
+
+
+def _is_api_like_url(url: str) -> bool:
+    path = "/" + "/".join(_path_tokens(url))
+    return any(token in path for token in ("/api/", "/rest/", "/graphql", "/v1/", "/v2/"))
+
+
+def _is_shape_sensitive_get_url(url: str) -> bool:
+    tokens = _path_tokens(url)
+    joined = " ".join(tokens)
+    return any(
+        token in joined
+        for token in (
+            "upload",
+            "download",
+            "excel",
+            "export",
+            "import",
+            "update",
+            "delete",
+            "create",
+            "submit",
+            "save",
+            "issue",
+            "approval",
+        )
+    )
+
+
+def _build_cookie_diagnostics(raw_index: List[Dict[str, Any]], metadata: Dict[str, Any]) -> Dict[str, Any]:
+    request_cookie_names = sorted({
+        name
+        for item in raw_index or []
+        for name in (item.get("request_cookie_names") or [])
+        if str(name or "").strip()
+    })
+    set_cookie_entries = [
+        entry
+        for item in raw_index or []
+        for entry in (item.get("set_cookie_flag_summary") or [])
+        if isinstance(entry, dict)
+    ]
+    set_cookie_names = sorted({str(entry.get("name") or "") for entry in set_cookie_entries if entry.get("name")})
+    sensitive_set_cookie_names = sorted({
+        str(entry.get("name") or "")
+        for entry in set_cookie_entries
+        if entry.get("name") and entry.get("sensitive")
+    })
+
+    flag_observations: Dict[str, Dict[str, Any]] = {}
+    for entry in set_cookie_entries:
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        obs = flag_observations.setdefault(
+            name,
+            {
+                "sensitive": False,
+                "secure_seen": False,
+                "secure_missing_seen": False,
+                "httponly_seen": False,
+                "httponly_missing_seen": False,
+                "samesite_values": [],
+                "samesite_missing_seen": False,
+                "observation_count": 0,
+            },
+        )
+        obs["observation_count"] += 1
+        obs["sensitive"] = bool(obs["sensitive"] or entry.get("sensitive"))
+        if entry.get("secure"):
+            obs["secure_seen"] = True
+        else:
+            obs["secure_missing_seen"] = True
+        if entry.get("httponly"):
+            obs["httponly_seen"] = True
+        else:
+            obs["httponly_missing_seen"] = True
+        samesite = str(entry.get("samesite") or "").strip()
+        if samesite:
+            values = obs.setdefault("samesite_values", [])
+            if samesite not in values:
+                values.append(samesite)
+        else:
+            obs["samesite_missing_seen"] = True
+
+    notes: List[str] = []
+    manual_cookie_names = metadata.get("manual_auth_cookie_names") or []
+    if manual_cookie_names and not set_cookie_entries:
+        notes.append(
+            "manual_auth_cookie_flags_not_observable_without_set_cookie: "
+            "Cookie request headers prove replay, but Secure/HttpOnly/SameSite can only be judged from Set-Cookie responses."
+        )
+    if request_cookie_names and not set_cookie_entries:
+        notes.append("session_cookie_sent_but_server_never_reissued_cookie_in_observed_responses")
+
+    return {
+        "manual_auth_cookie_names": manual_cookie_names,
+        "request_cookie_names_seen": request_cookie_names,
+        "set_cookie_response_count": sum(1 for item in raw_index or [] if item.get("set_cookie_present")),
+        "set_cookie_names_seen": set_cookie_names,
+        "sensitive_set_cookie_names_seen": sensitive_set_cookie_names,
+        "set_cookie_flag_observations": flag_observations,
+        "notes": notes,
+    }
+
+
+def _build_probe_shape_diagnostics(raw_index: List[Dict[str, Any]]) -> Dict[str, Any]:
+    business_entries = [
+        item for item in raw_index or []
+        if str(item.get("family") or "") == "authenticated_business_probe"
+    ]
+    status_families = Counter(_status_family(item.get("status_code")) for item in business_entries)
+    shape_sensitive_gets = [
+        item for item in business_entries
+        if str(item.get("method") or "").upper() == "GET"
+        and not item.get("request_body_present")
+        and _is_shape_sensitive_get_url(str(item.get("url") or ""))
+    ]
+    api_entries = [item for item in business_entries if _is_api_like_url(str(item.get("url") or ""))]
+    api_error_entries = [
+        item for item in api_entries
+        if _status_family(item.get("status_code")) in {"4xx", "5xx"}
+    ]
+
+    notes: List[str] = []
+    if business_entries:
+        error_ratio = (status_families.get("4xx", 0) + status_families.get("5xx", 0)) / max(1, len(business_entries))
+        if error_ratio >= 0.6:
+            notes.append(
+                "high_error_ratio_on_authenticated_business_probes: selected URLs may require the original SPA method/body/CSRF headers."
+            )
+    if len(shape_sensitive_gets) >= max(3, len(business_entries) // 4):
+        notes.append(
+            "many_shape_sensitive_endpoints_called_as_plain_get: replay real browser requests for upload/download/update/export APIs when possible."
+        )
+    if api_entries and len(api_error_entries) / max(1, len(api_entries)) >= 0.6:
+        notes.append("api_probe_replay_gap_likely: API endpoints were discovered, but most returned 4xx/5xx to generic probes.")
+
+    return {
+        "authenticated_business_probe_count": len(business_entries),
+        "status_code_counts": _count_values(business_entries, "status_code"),
+        "status_family_counts": dict(status_families),
+        "content_family_counts": dict(Counter(_content_family(item.get("content_type")) for item in business_entries)),
+        "api_like_probe_count": len(api_entries),
+        "api_like_4xx_5xx_count": len(api_error_entries),
+        "shape_sensitive_plain_get_count": len(shape_sensitive_gets),
+        "shape_sensitive_plain_get_examples": [
+            {
+                "url": item.get("url"),
+                "status_code": item.get("status_code"),
+                "raw_ref": item.get("raw_ref"),
+            }
+            for item in shape_sensitive_gets[:10]
+        ],
+        "notes": notes,
+    }
+
+
+def _build_scan_diagnostics(
+    *,
+    results: Dict[str, Any],
+    raw_index: List[Dict[str, Any]],
+    request_failures: List[Dict[str, Any]],
+    discovered_endpoints: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    metadata = results.get("metadata") or {}
+    auth_landing_url = str(metadata.get("auth_landing_url") or "")
+    endpoint_urls = [str(ep.get("url") or "") for ep in discovered_endpoints or [] if isinstance(ep, dict)]
+    raw_urls = [str(item.get("url") or "") for item in raw_index or []]
+    hash_route_present = "#" in auth_landing_url or any("#" in url for url in endpoint_urls[:50])
+
+    notes: List[str] = []
+    if hash_route_present:
+        notes.append(
+            "spa_hash_route_detected: URL fragments are client-side state and are not sent to the server; prioritize harvested API/XHR endpoints."
+        )
+
+    cookie_diag = _build_cookie_diagnostics(raw_index, metadata)
+    probe_diag = _build_probe_shape_diagnostics(raw_index)
+    notes.extend(cookie_diag.get("notes") or [])
+    notes.extend(probe_diag.get("notes") or [])
+
+    auth_state_loss_events = [
+        item for item in request_failures or []
+        if str(item.get("error_class") or "") == "AuthStateLoss"
+    ]
+
+    return {
+        "auth": {
+            "authenticated": bool(metadata.get("authenticated")),
+            "manual_auth_enabled": bool(metadata.get("manual_auth_enabled")),
+            "manual_auth_cookie_names": metadata.get("manual_auth_cookie_names") or [],
+            "manual_auth_header_names": metadata.get("manual_auth_header_names") or [],
+            "auth_landing_url": auth_landing_url or None,
+            "auth_landing_has_fragment": "#" in auth_landing_url,
+            "auth_state_loss_count": len(auth_state_loss_events),
+        },
+        "coverage_shape": {
+            "raw_request_count": len(raw_index or []),
+            "discovered_endpoint_count": len(discovered_endpoints or []),
+            "status_code_counts": _count_values(raw_index, "status_code"),
+            "status_family_counts": dict(Counter(_status_family(item.get("status_code")) for item in raw_index or [])),
+            "content_family_counts": dict(Counter(_content_family(item.get("content_type")) for item in raw_index or [])),
+            "auth_state_counts": _count_values(raw_index, "auth_state"),
+            "family_counts": _count_values(raw_index, "family"),
+            "api_like_raw_request_count": sum(1 for url in raw_urls if _is_api_like_url(url)),
+            "api_like_discovered_endpoint_count": sum(1 for url in endpoint_urls if _is_api_like_url(url)),
+        },
+        "cookies": cookie_diag,
+        "authenticated_business_probe": probe_diag,
+        "diagnostic_notes": notes,
+        "recommended_next_steps": [
+            "If Set-Cookie is never observed, capture the real login or SSO redirect response once so cookie flags can be evaluated.",
+            "For SPA/API applications, provide seed URLs or replay captures for real XHR calls with method, body, CSRF, Origin, Referer, and Authorization headers.",
+            "If many authenticated probes return 403/500, prefer browser-observed API requests over generic GET probes for evidence collection.",
+        ],
+    }
+
+
 def finalize_and_write_results(
     *,
     results: Dict[str, Any],
@@ -570,6 +834,20 @@ def finalize_and_write_results(
         for endpoint in discovered_endpoints[:20]
     ]
 
+    scan_diagnostics = _build_scan_diagnostics(
+        results=results,
+        raw_index=raw_index,
+        request_failures=request_failures,
+        discovered_endpoints=discovered_endpoints,
+    )
+    results["metadata"]["scan_diagnostics"] = {
+        "diagnostic_notes": scan_diagnostics.get("diagnostic_notes") or [],
+        "cookie_notes": (scan_diagnostics.get("cookies") or {}).get("notes") or [],
+        "authenticated_business_probe_notes": (
+            scan_diagnostics.get("authenticated_business_probe") or {}
+        ).get("notes") or [],
+    }
+
     results["summary"] = compute_summary_fn(results)
     results["raw_index"] = raw_index
 
@@ -581,6 +859,12 @@ def finalize_and_write_results(
     log_fn("SUMMARY", f"Candidate signals: {len(candidate_signals)}")
 
     save_json_fn(out_path, results)
+    scan_diagnostics_path = run_dir / "debug" / "scan_diagnostics.json"
+    scan_diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+    scan_diagnostics_path.write_text(
+        json.dumps(scan_diagnostics, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     candidate_signal_path = run_dir / "debug" / "candidate_signals.json"
     candidate_signal_path.parent.mkdir(parents=True, exist_ok=True)
     candidate_signal_path.write_text(
