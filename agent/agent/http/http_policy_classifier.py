@@ -260,7 +260,11 @@ def _build_cookie_signals(
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     code = feats.get("status_code")
-    if _is_static_response(feats) or code is None or code >= 400:
+
+    cookie_objects = list(feats.get("cookie_objects") or [])
+    if _is_static_response(feats) or code is None:
+        return out
+    if code >= 400 and not cookie_objects:
         return out
 
     requested_url = str(request_meta.get("url") or "")
@@ -275,7 +279,6 @@ def _build_cookie_signals(
 
     request_sensitive_cookie_names = {str(item).strip().lower() for item in (feats.get("request_sensitive_cookie_names") or []) if str(item).strip()}
     request_sensitive_cookie_names_missing_in_response = {str(item).strip().lower() for item in (feats.get("request_sensitive_cookie_names_missing_in_response") or []) if str(item).strip()}
-    cookie_objects = list(feats.get("cookie_objects") or [])
     response_cookie_names = {str(cookie.get("name") or "").strip().lower() for cookie in cookie_objects if str(cookie.get("name") or "").strip()}
     seen_cookie_issue_keys: Set[tuple[str, str]] = set()
 
@@ -308,13 +311,14 @@ def _build_cookie_signals(
             "response_cookie_names": sorted(response_cookie_names),
             "sensitive_reason": cookie.get("sensitive_reason") or [],
             "is_https_response": is_https_response,
+            "set_cookie_observed": True,
             "final_url": final_url,
             "requested_url": requested_url,
         }
 
         checks = [
             (not bool(cookie.get("httponly")), "httponly_missing", "COOKIE_HTTPONLY_MISSING", f"Cookie '{name}' missing HttpOnly attribute", "Low", 0.92 if (sensitive_cookie or request_sensitive_candidate) else 0.84, "CWE-1004", None, None),
-            (not bool(cookie.get("secure")), "secure_missing", "COOKIE_SECURE_MISSING", f"Cookie '{name}' missing Secure attribute", "Low" if is_https_response else "Info", 0.94 if (is_https_response and (sensitive_cookie or request_sensitive_candidate or prefix in {"__Host-", "__Secure-"})) else 0.82, "CWE-614", None, None),
+            (not bool(cookie.get("secure")), "secure_missing", "COOKIE_SECURE_MISSING", f"Cookie '{name}' missing Secure attribute", "Low", 0.94 if (is_https_response and (sensitive_cookie or request_sensitive_candidate or prefix in {"__Host-", "__Secure-"})) else 0.88, "CWE-614", None, None),
             (not bool(cookie.get("samesite")), "samesite_missing", "COOKIE_SAMESITE_MISSING", f"Cookie '{name}' missing SameSite attribute", "Info", 0.86 if (sensitive_cookie or request_sensitive_candidate) else 0.80, None, "DIRECT", "Sensitive or authentication-related cookie missing SameSite attribute."),
         ]
 

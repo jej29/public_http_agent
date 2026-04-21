@@ -1549,7 +1549,14 @@ def _looks_like_local_unix_path(path: str) -> bool:
 
 
 def _looks_like_local_windows_path(path: str) -> bool:
-    return bool(re.match(r"^[A-Za-z]:\\", str(path or "").strip()))
+    s = str(path or "").strip()
+    if not re.match(r"^[A-Za-z]:\\", s):
+        return False
+    # Minified JavaScript often contains escaped strings such as "t:\n ..."
+    # that look drive-like after regex matching, but are not filesystem paths.
+    if re.match(r"^[A-Za-z]:\\[nrt](?:\s|\\|$)", s, re.I):
+        return False
+    return True
 
 
 def _looks_like_local_filesystem_path(path: str) -> bool:
@@ -1609,6 +1616,8 @@ def _clean_file_paths(file_paths: List[str], request_url: str, final_url: str) -
             continue
 
         if re.fullmatch(r"[A-Za-z]:\\?", s):
+            continue
+        if re.match(r"^[A-Za-z]:\\[nrt](?:\s|\\|$)", s, re.I):
             continue
         if s in {"/"}:
             continue

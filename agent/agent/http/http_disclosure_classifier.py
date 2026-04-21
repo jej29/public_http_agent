@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import re
 from typing import Any, Dict, List
+from urllib.parse import urlsplit
 
 from agent.http.disclosure_enrichment import build_detector_disclosure_signals
 from agent.http.http_signal_builder import build_signal as _build_signal
@@ -288,6 +289,75 @@ def _is_static_response(feats: Dict[str, Any]) -> bool:
     return (feats.get("response_kind") or "") == "static_asset"
 
 
+def _is_static_javascript_response(
+    response_kind: str,
+    final_url: str,
+    snapshot: Dict[str, Any],
+) -> bool:
+    if response_kind != "static_asset":
+        return False
+    path = urlsplit(final_url or "").path.lower()
+    if path.endswith(".js") or path.endswith(".mjs"):
+        return True
+    headers = snapshot.get("headers") or {}
+    if isinstance(headers, dict):
+        content_type = ""
+        for key, value in headers.items():
+            if str(key).lower() == "content-type":
+                content_type = str(value or "").lower()
+                break
+        return "javascript" in content_type
+    return False
+
+
+def _extract_client_bundle_disclosure_markers(body: str) -> Dict[str, List[str]]:
+    text = str(body or "")
+    if not text:
+        return {}
+
+    source_markers = _dedup(
+        re.findall(r"(?:sourceURL|sourceMappingURL)=webpack:///[^\s\"')]+", text, re.I)
+        + re.findall(r"webpack:///[^\s\"')]*?/src/[^\s\"')]+", text, re.I)
+    )[:5]
+    all_urls = _dedup(re.findall(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", text))
+    interesting_url_tokens = (
+        "10.",
+        "127.",
+        "172.",
+        "192.168.",
+        "localhost",
+        ".internal",
+        ".corp",
+        "apm.",
+        "elastic",
+        "samsungds",
+        "/api/",
+        "/rest/",
+    )
+    external_urls = [
+        url for url in all_urls
+        if any(token in url.lower() for token in interesting_url_tokens)
+    ][:8]
+
+    debug_tokens: List[str] = []
+    lowered = text.lower()
+    if "console.trace" in lowered:
+        debug_tokens.append("console.trace")
+    for token in ("productgroupid", "productid", "productphase", "rumservertype", "applicationservers", "loglevel"):
+        if token in lowered:
+            debug_tokens.append(token)
+    debug_tokens = _dedup(debug_tokens)[:8]
+
+    out: Dict[str, List[str]] = {}
+    if source_markers:
+        out["source_map_markers"] = source_markers
+    if external_urls:
+        out["client_side_urls"] = external_urls
+    if debug_tokens and (external_urls or source_markers):
+        out["debug_or_config_tokens"] = debug_tokens
+    return out
+
+
 def _is_auth_or_session_loss(feats: Dict[str, Any]) -> bool:
     return bool(
         feats.get("auth_required_like")
@@ -408,6 +478,9 @@ def _build_error_disclosure_signals(
     technology_fingerprint: List[str],
     tech: str,
 ) -> List[Dict[str, Any]]:
+    if _is_static_javascript_response(response_kind, final_url, snapshot):
+        return []
+
     error_class = str(feats.get("error_exposure_class") or "")
     stack_traces = _meaningful_stack_traces(feats.get("stack_traces") or [])
     file_paths = _meaningful_file_paths(feats.get("file_paths") or [])
@@ -492,6 +565,70 @@ def _build_error_disclosure_signals(
             root_cause_signature=f"error:{error_class}|template:{template_fingerprint}|tech:{tech}",
             technology_fingerprint=technology_fingerprint,
             template_fingerprint=template_fingerprint or None,
+        )
+    ]
+
+
+def _build_static_client_bundle_disclosure_signals(
+    request_meta: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    feats: Dict[str, Any],
+    response_kind: str,
+    final_url: str,
+    technology_fingerprint: List[str],
+    tech: str,
+) -> List[Dict[str, Any]]:
+    if not _is_static_javascript_response(response_kind, final_url, snapshot):
+        return []
+    body = str(feats.get("body_text") or snapshot.get("body_text") or snapshot.get("body_snippet") or "")
+    markers = _extract_client_bundle_disclosure_markers(body)
+    if not markers:
+        return []
+
+    source_markers = markers.get("source_map_markers") or []
+    urls = markers.get("client_side_urls") or []
+    debug_tokens = markers.get("debug_or_config_tokens") or []
+
+    exposed_information: List[str] = []
+    if source_markers:
+        exposed_information.append("Webpack source map/sourceURL module paths are present in the client bundle")
+    if urls:
+        exposed_information.extend([f"Client-side URL: {item}" for item in urls[:3]])
+    if debug_tokens:
+        exposed_information.append("Client-side debug/config tokens are present: " + ", ".join(debug_tokens[:6]))
+    exposed_information = _dedup(exposed_information)
+    if not exposed_information:
+        return []
+
+    has_runtime_config = bool(urls or debug_tokens)
+    return [
+        _build_signal(
+            signal_type="client_bundle_disclosure",
+            finding_type="HTTP_SYSTEM_INFO_EXPOSURE",
+            family="HTTP_BODY_DISCLOSURE",
+            subtype="client_bundle_source_map_or_config",
+            title="Client Bundle Discloses Source Map Or Runtime Configuration Details",
+            severity="Info" if not has_runtime_config else "Low",
+            confidence=0.82 if source_markers else 0.87,
+            where="response.body",
+            evidence={
+                "final_url": final_url,
+                "requested_url": str(request_meta.get("url") or ""),
+                "response_kind": response_kind,
+                "source_map_markers": source_markers,
+                "client_side_urls": urls,
+                "debug_or_config_tokens": debug_tokens,
+                "technology_fingerprint": technology_fingerprint,
+            },
+            exposed_information=exposed_information[:6],
+            leak_type="client_bundle_metadata",
+            leak_value=_first(urls) or _first(source_markers) or _first(debug_tokens) or final_url,
+            cwe="CWE-497",
+            owasp="A05:2021 Security Misconfiguration",
+            scope_hint="route-specific",
+            policy_object="client_bundle",
+            root_cause_signature=f"client_bundle:{tech}|markers:{','.join(sorted(markers.keys()))}",
+            technology_fingerprint=technology_fingerprint,
         )
     ]
 
@@ -835,6 +972,17 @@ def build_disclosure_signals(
             snapshot=snapshot,
             feats=feats,
             info_skip=info_skip,
+        )
+    )
+    out.extend(
+        _build_static_client_bundle_disclosure_signals(
+            request_meta,
+            snapshot,
+            feats,
+            response_kind,
+            final_url,
+            technology_fingerprint,
+            tech,
         )
     )
     if info_skip:

@@ -139,11 +139,13 @@ def _normalize_technology_fingerprint(items: List[Any]) -> List[str]:
     return out[:10]
 
 
-def _classification_rank(finding: Dict[str, Any]) -> tuple[int, int, int, int]:
+def _classification_rank(finding: Dict[str, Any]) -> tuple[int, ...]:
     candidate_type = str(finding.get("type") or "")
     cwe = str(finding.get("cwe") or "")
     mapping_status = str(finding.get("cwe_mapping_status") or "")
     confidence = float(finding.get("confidence") or 0.0)
+    subtype = str(finding.get("subtype") or "")
+    evidence = finding.get("evidence") or {}
 
     type_priority = {
         "AUTHENTICATED_ONLY_INFORMATION_DISCLOSURE": 102,
@@ -172,8 +174,14 @@ def _classification_rank(finding: Dict[str, Any]) -> tuple[int, int, int, int]:
         "HTTPS_REDIRECT_MISSING": 10,
     }
 
+    cookie_direct_evidence_bonus = 0
+    if candidate_type in {"COOKIE_HTTPONLY_MISSING", "COOKIE_SECURE_MISSING", "COOKIE_SAMESITE_MISSING"}:
+        if evidence.get("set_cookie_observed") or subtype in {"httponly_missing", "secure_missing", "samesite_missing"}:
+            cookie_direct_evidence_bonus = 1
+
     return (
         type_priority.get(candidate_type, 0),
+        cookie_direct_evidence_bonus,
         1 if cwe else 0,
         1 if not mapping_status else 0,
         int(confidence * 100),
