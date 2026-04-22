@@ -122,6 +122,8 @@ def should_run_llm_judge(candidate: Dict[str, Any]) -> bool:
         # header/banner-only는 LLM까지 태우지 않음
         if family == "HTTP_HEADER_DISCLOSURE":
             return False
+        if str(candidate.get("subtype") or "") == "client_bundle_source_map_or_config":
+            return False
 
         strong_versions = evidence.get("strong_version_tokens_in_body") or []
         internal_ips = evidence.get("internal_ips") or []

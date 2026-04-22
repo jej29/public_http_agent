@@ -203,6 +203,7 @@ def _is_concrete_error_disclosure(candidate: Dict[str, Any]) -> bool:
 
 def _has_concrete_system_info(candidate: Dict[str, Any]) -> bool:
     evidence = _evidence(candidate)
+    subtype = str(candidate.get("subtype") or "")
 
     strong_versions = evidence.get("strong_version_tokens_in_body") or []
     internal_ips = evidence.get("internal_ips") or []
@@ -216,6 +217,12 @@ def _has_concrete_system_info(candidate: Dict[str, Any]) -> bool:
     file_paths = evidence.get("file_paths") or []
     decision_reasons = evidence.get("decision_reasons") or []
     response_kind = str(evidence.get("response_kind") or "").lower()
+    source_map_markers = evidence.get("source_map_markers") or []
+    client_side_urls = evidence.get("client_side_urls") or []
+    debug_or_config_tokens = evidence.get("debug_or_config_tokens") or []
+
+    if subtype == "client_bundle_source_map_or_config":
+        return bool(source_map_markers or client_side_urls or debug_or_config_tokens)
 
     # HTML shell / weak document-like ?섏씠吏??concrete system info濡?蹂댁? ?딆쓬
     if response_kind == "static_asset":

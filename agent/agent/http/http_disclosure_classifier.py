@@ -629,6 +629,10 @@ def _build_static_client_bundle_disclosure_signals(
             policy_object="client_bundle",
             root_cause_signature=f"client_bundle:{tech}|markers:{','.join(sorted(markers.keys()))}",
             technology_fingerprint=technology_fingerprint,
+            signal_strength="strong",
+            signal_repeatability="likely_stable",
+            observation_scope="route_behavior",
+            verification_strategy="single_observation",
         )
     ]
 
