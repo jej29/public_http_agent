@@ -346,6 +346,9 @@ def should_drop_low_value_endpoint(ep: Dict[str, Any]) -> bool:
     url = endpoint_url(ep).lower()
     path = urlsplit(url).path.lower()
     filename = path.split("/")[-1]
+    kind = str(ep.get("kind") or "").strip().lower()
+    if kind == "asset_js":
+        return False
     if filename.endswith(LOW_VALUE_EXTS):
         return True
     if filename.startswith("readme"):
@@ -412,7 +415,11 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
             )
         ):
             priority += 4
-        if path.endswith((".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2")):
+        if path.endswith((".js", ".mjs")):
+            priority += 5
+            if any(token in path for token in ("/static/js/", "/assets/", "/js/", "chunk", "vendor", "app.", "main.")):
+                priority += 5
+        if path.endswith((".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2")):
             priority -= 3
 
         depth = len([segment for segment in path.split("/") if segment])
@@ -428,8 +435,9 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
         has_query = bool(urlsplit(url).query)
         path = (urlsplit(url).path or "/").lower()
         dynamic_like = any(token in path for token in (".do", ".action", ".php", "/api/", "/rest/"))
+        static_js_like = path.endswith((".js", ".mjs"))
 
-        allow_per_bucket = 2 if (has_query or dynamic_like) else 1
+        allow_per_bucket = 2 if (has_query or dynamic_like or static_js_like) else 1
         if count >= allow_per_bucket:
             continue
 

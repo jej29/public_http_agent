@@ -667,10 +667,21 @@ def _build_static_plan_from_endpoints(
     static_plan: List[RequestSpec] = []
     seen_plan_keys = set()
 
+    js_bundle_budget = int(os.getenv("CLIENT_BUNDLE_PROBE_MAX_TARGETS", "12"))
+    js_bundle_count = 0
+
     for idx, ep in enumerate(discovered_endpoints):
         ep_url = endpoint_url(ep)
         ep_kind = endpoint_kind(ep)
         intensity = choose_probe_intensity_for_endpoint(idx, ep)
+
+        if ep_kind == "asset_js":
+            if js_bundle_count >= js_bundle_budget:
+                continue
+            js_bundle_count += 1
+            # Keep enough lightweight probes to cover source-map/client-config
+            # exposure without suppressing useful parent-directory checks.
+            intensity = os.getenv("CLIENT_BUNDLE_PROBE_INTENSITY", "light").strip().lower() or "light"
 
         if is_session_destructive_endpoint(ep):
             log(
@@ -2578,6 +2589,7 @@ async def run_scan(
                     "auth_session_budget_seconds": os.getenv("AUTH_SESSION_BUDGET_SECONDS", "0"),
                     "auth_probe_batch_size": os.getenv("AUTH_PROBE_BATCH_SIZE", ""),
                     "shape_sensitive_get_error_threshold": os.getenv("SHAPE_SENSITIVE_GET_ERROR_THRESHOLD", "3"),
+                    "client_bundle_probe_max_targets": os.getenv("CLIENT_BUNDLE_PROBE_MAX_TARGETS", "12"),
                 },
             },
             "summary": {},
