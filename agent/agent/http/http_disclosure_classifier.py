@@ -601,39 +601,44 @@ def _build_static_client_bundle_disclosure_signals(
         return []
 
     has_runtime_config = bool(urls or debug_tokens)
+    signal = _build_signal(
+        signal_type="client_bundle_disclosure",
+        finding_type="HTTP_SYSTEM_INFO_EXPOSURE",
+        family="HTTP_BODY_DISCLOSURE",
+        subtype="client_bundle_source_map_or_config",
+        title="Client Bundle Discloses Source Map Or Runtime Configuration Details",
+        severity="Info" if not has_runtime_config else "Low",
+        confidence=0.82 if source_markers else 0.87,
+        where="response.body",
+        evidence={
+            "final_url": final_url,
+            "requested_url": str(request_meta.get("url") or ""),
+            "response_kind": response_kind,
+            "source_map_markers": source_markers,
+            "client_side_urls": urls,
+            "debug_or_config_tokens": debug_tokens,
+            "technology_fingerprint": technology_fingerprint,
+        },
+        exposed_information=exposed_information[:6],
+        leak_type="client_bundle_metadata",
+        leak_value=_first(urls) or _first(source_markers) or _first(debug_tokens) or final_url,
+        cwe="CWE-497",
+        owasp="A05:2021 Security Misconfiguration",
+        scope_hint="route-specific",
+        policy_object="client_bundle",
+        root_cause_signature=f"client_bundle:{tech}|markers:{','.join(sorted(markers.keys()))}",
+        technology_fingerprint=technology_fingerprint,
+    )
+    signal.update(
+        {
+            "signal_strength": "strong",
+            "signal_repeatability": "likely_stable",
+            "observation_scope": "route_behavior",
+            "verification_strategy": "single_observation",
+        }
+    )
     return [
-        _build_signal(
-            signal_type="client_bundle_disclosure",
-            finding_type="HTTP_SYSTEM_INFO_EXPOSURE",
-            family="HTTP_BODY_DISCLOSURE",
-            subtype="client_bundle_source_map_or_config",
-            title="Client Bundle Discloses Source Map Or Runtime Configuration Details",
-            severity="Info" if not has_runtime_config else "Low",
-            confidence=0.82 if source_markers else 0.87,
-            where="response.body",
-            evidence={
-                "final_url": final_url,
-                "requested_url": str(request_meta.get("url") or ""),
-                "response_kind": response_kind,
-                "source_map_markers": source_markers,
-                "client_side_urls": urls,
-                "debug_or_config_tokens": debug_tokens,
-                "technology_fingerprint": technology_fingerprint,
-            },
-            exposed_information=exposed_information[:6],
-            leak_type="client_bundle_metadata",
-            leak_value=_first(urls) or _first(source_markers) or _first(debug_tokens) or final_url,
-            cwe="CWE-497",
-            owasp="A05:2021 Security Misconfiguration",
-            scope_hint="route-specific",
-            policy_object="client_bundle",
-            root_cause_signature=f"client_bundle:{tech}|markers:{','.join(sorted(markers.keys()))}",
-            technology_fingerprint=technology_fingerprint,
-            signal_strength="strong",
-            signal_repeatability="likely_stable",
-            observation_scope="route_behavior",
-            verification_strategy="single_observation",
-        )
+        signal
     ]
 
 
