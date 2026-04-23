@@ -349,6 +349,8 @@ def should_drop_low_value_endpoint(ep: Dict[str, Any]) -> bool:
     kind = str(ep.get("kind") or "").strip().lower()
     if kind == "asset_js":
         return False
+    if path.endswith((".html", ".htm")):
+        return False
     if filename.endswith(LOW_VALUE_EXTS):
         return True
     if filename.startswith("readme"):
@@ -415,6 +417,10 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
             )
         ):
             priority += 4
+        if path.endswith((".html", ".htm")):
+            priority += 4
+            if any(token in path for token in ("nda", "privacy", "portal", "main", "index")):
+                priority += 3
         if path.endswith((".js", ".mjs")):
             priority += 5
             if any(token in path for token in ("/static/js/", "/assets/", "/js/", "chunk", "vendor", "app.", "main.")):
@@ -436,8 +442,9 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
         path = (urlsplit(url).path or "/").lower()
         dynamic_like = any(token in path for token in (".do", ".action", ".php", "/api/", "/rest/"))
         static_js_like = path.endswith((".js", ".mjs"))
+        app_html_like = path.endswith((".html", ".htm"))
 
-        allow_per_bucket = 2 if (has_query or dynamic_like or static_js_like) else 1
+        allow_per_bucket = 2 if (has_query or dynamic_like or static_js_like or app_html_like) else 1
         if count >= allow_per_bucket:
             continue
 
@@ -471,6 +478,7 @@ def prepare_discovered_endpoints(
     authenticated_endpoints: List[Dict[str, Any]],
     allowed_app_prefixes: List[str],
     max_endpoints: int,
+    seed_urls: List[str] | None = None,
 ) -> tuple[List[Dict[str, Any]], int, List[Dict[str, Any]], List[Dict[str, Any]]]:
     filtered_anonymous_endpoints = filter_endpoints_by_app_scope(
         anonymous_endpoints,
@@ -521,13 +529,66 @@ def prepare_discovered_endpoints(
         if endpoint_url(endpoint)
     }
 
+    explicit_seed_urls: List[str] = []
+    seen_seed_urls = set()
+    for raw_seed in seed_urls or []:
+        seed = str(raw_seed or "").strip()
+        if not seed or seed in seen_seed_urls:
+            continue
+        seen_seed_urls.add(seed)
+        if not _url_in_allowed_app_scope(seed, allowed_app_prefixes, target):
+            continue
+        explicit_seed_urls.append(seed)
+        discovered_endpoint_map.setdefault(
+            seed,
+            {
+                "url": seed,
+                "kind": "page",
+                "source": "explicit_seed",
+                "depth": 0,
+                "method": "GET",
+                "field_names": [],
+                "query_param_names": [],
+                "is_redirect_target": False,
+                "is_session_destructive": False,
+                "score": 100,
+                "state": "seeded",
+                "states": ["seeded"],
+            },
+        )
+
     pruned_urls = prune_discovered_endpoints(
         list(discovered_endpoint_map.keys()),
         max_endpoints=max_endpoints,
     )
+    for seed in reversed(explicit_seed_urls):
+        if seed in pruned_urls:
+            continue
+        pruned_urls.insert(0, seed)
+    if len(pruned_urls) > max_endpoints:
+        keep = set(explicit_seed_urls)
+        trimmed: List[str] = []
+        for url in pruned_urls:
+            if len(trimmed) >= max_endpoints:
+                break
+            if url in keep or url not in trimmed:
+                trimmed.append(url)
+        pruned_urls = trimmed[:max_endpoints]
     if target not in pruned_urls:
         pruned_urls = [target] + pruned_urls
-        pruned_urls = pruned_urls[:max_endpoints]
+    if len(pruned_urls) > max_endpoints:
+        must_keep = {target, *explicit_seed_urls}
+        trimmed: List[str] = []
+        for url in pruned_urls:
+            if url in trimmed:
+                continue
+            if len(trimmed) < max_endpoints or url in must_keep:
+                trimmed.append(url)
+        if len(trimmed) > max_endpoints:
+            preferred = [url for url in trimmed if url in must_keep]
+            others = [url for url in trimmed if url not in must_keep]
+            trimmed = (preferred + others)[:max_endpoints]
+        pruned_urls = trimmed[:max_endpoints]
 
     discovered_endpoints = [
         discovered_endpoint_map.get(

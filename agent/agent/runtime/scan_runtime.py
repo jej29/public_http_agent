@@ -2814,6 +2814,7 @@ async def run_scan(
             authenticated_endpoints=authenticated_endpoints,
             allowed_app_prefixes=allowed_app_prefixes,
             max_endpoints=max_endpoints,
+            seed_urls=seed_urls or [],
         )
 
         static_plan = _build_static_plan_from_endpoints(
