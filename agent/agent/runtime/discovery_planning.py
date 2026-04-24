@@ -126,6 +126,8 @@ def choose_probe_intensity_for_endpoint(rank: int, ep: Dict[str, Any]) -> str:
     if path in {"", "/"}:
         return "medium"
     if kind == "asset_js":
+        if any(token in path for token in ("chunk-vendors", "/app.js", "/main.js", "/runtime.js", "/vendors", "vendor", "app.", "main.")):
+            return "medium"
         return "light"
 
     high_signal_tokens = (
@@ -162,6 +164,9 @@ def choose_probe_intensity_for_endpoint(rank: int, ep: Dict[str, Any]) -> str:
         "/instructions",
     )
     if any(token in url for token in medium_value_tokens):
+        return "medium"
+
+    if any(token in url for token in ("/admin/admission", "/admin/acadmgmt", "/admin/")):
         return "medium"
 
     if auth_only:
@@ -425,6 +430,10 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
             priority += 5
             if any(token in path for token in ("/static/js/", "/assets/", "/js/", "chunk", "vendor", "app.", "main.")):
                 priority += 5
+            if any(token in path for token in ("chunk-vendors", "/app.js", "/main.js", "/runtime.js", "/vendors", "vendor", "app.", "main.")):
+                priority += 8
+        if any(token in path for token in ("/admin/admission", "/admin/acadmgmt", "/admin/")):
+            priority += 8
         if path.endswith((".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2")):
             priority -= 3
 

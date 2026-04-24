@@ -960,16 +960,38 @@ def _notfound_specs(base: str, headers: Dict[str, str]) -> List[RequestSpec]:
     ]
 
 def _risky_method_specs(target_url: str, headers: Dict[str, str]) -> List[RequestSpec]:
-    methods = [
-        ("OPTIONS", "options_probe"),
-        ("PROPFIND", "safe_extended_method_probe"),
-    ]
+    path_l = (urlsplit(target_url).path or "/").lower()
+    high_value_method_target = any(
+        token in path_l
+        for token in (
+            "/admin",
+            "/admission",
+            "/acadmgmt",
+            "/api/",
+            "/rest/",
+            "/common",
+            ".do",
+            ".action",
+            ".jsp",
+        )
+    )
+
+    if high_value_method_target:
+        methods = [
+            ("PROPFIND", "safe_extended_method_probe"),
+            ("PATCH", "safe_extended_method_probe"),
+            ("OPTIONS", "options_probe"),
+        ]
+    else:
+        methods = [
+            ("OPTIONS", "options_probe"),
+            ("PROPFIND", "safe_extended_method_probe"),
+        ]
 
     if os.getenv("ENABLE_RISKY_METHOD_PROBES", "off").lower() == "on":
         methods.extend(
             [
                 ("TRACE", "unsafe_method_probe"),
-                ("PATCH", "unsafe_method_probe"),
                 ("PUT", "unsafe_method_probe"),
                 ("DELETE", "unsafe_method_probe"),
             ]
@@ -3068,12 +3090,16 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
         total_budget = int(os.getenv("LEGACY_DO_REQUEST_BUDGET", "10"))
 
     elif intensity == "light":
+        high_value_method_target = any(
+            tok in target_path_l
+            for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", "/common", ".do", ".action", ".jsp")
+        )
         category_limits = {
             "baseline": 4,
             "notfound": 2,
             "resources": 4,
             "directory": 1,
-            "methods": 1 if http_sensitive_target else 0,
+            "methods": 3 if high_value_method_target else (1 if http_sensitive_target else 0),
             "cors": 0,
             "headers": 1 if http_sensitive_target else 0,
             "path": 1 if http_sensitive_target else 0,
@@ -3083,12 +3109,16 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
         total_budget = int(os.getenv("LIGHT_REQUEST_BUDGET", "12"))
 
     elif intensity == "medium":
+        high_value_method_target = any(
+            tok in target_path_l
+            for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", "/common", ".do", ".action", ".jsp")
+        )
         category_limits = {
             "baseline": 4,
             "notfound": 2,
             "resources": 6,
             "directory": 2,
-            "methods": 2 if http_sensitive_target else 0,
+            "methods": 3 if high_value_method_target else (2 if http_sensitive_target else 0),
             "cors": 0,
             "headers": 2 if http_sensitive_target else 1,
             "path": 2 if http_sensitive_target else 0,
@@ -3098,12 +3128,16 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
         total_budget = int(os.getenv("MEDIUM_REQUEST_BUDGET", "24"))
 
     else:
+        high_value_method_target = any(
+            tok in target_path_l
+            for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", "/common", ".do", ".action", ".jsp")
+        )
         category_limits = {
             "baseline": 4,
             "notfound": 2,
             "resources": 8,
             "directory": 3,
-            "methods": 3 if http_sensitive_target else 0,
+            "methods": 4 if high_value_method_target else (3 if http_sensitive_target else 0),
             "cors": 0,
             "headers": 3 if http_sensitive_target else 1,
             "path": 4 if http_sensitive_target else 0,

@@ -53,6 +53,7 @@ from agent.runtime.discovery_planning import (
     endpoint_states,
     endpoint_url,
     filter_request_specs_by_app_scope,
+    is_authenticated_only_endpoint,
     is_session_destructive_endpoint,
     merge_discovered_endpoints,
     prepare_discovered_endpoints,
@@ -819,7 +820,35 @@ def _build_static_plan_from_endpoints(
     js_bundle_budget = int(os.getenv("CLIENT_BUNDLE_PROBE_MAX_TARGETS", "12"))
     js_bundle_count = 0
 
-    for idx, ep in enumerate(discovered_endpoints):
+    def _static_endpoint_priority(ep: Dict[str, Any]) -> tuple:
+        ep_url = endpoint_url(ep).lower()
+        path = urlsplit(ep_url).path or "/"
+        kind = endpoint_kind(ep)
+        score = int(ep.get("score", 0) or 0) if isinstance(ep, dict) else 0
+
+        high_value_route = any(
+            token in path
+            for token in ("/admin/admission", "/admin/acadmgmt", "/admin/", "/api/", "/rest/", "/common", ".do", ".action", ".jsp")
+        )
+        priority_bundle = kind == "asset_js" and any(
+            token in path
+            for token in ("chunk-vendors", "/app.js", "/main.js", "/runtime.js", "/vendors", "vendor", "app.", "main.")
+        )
+        auth_only = is_authenticated_only_endpoint(ep)
+        depth = int(ep.get("depth", 9999) or 9999) if isinstance(ep, dict) else 9999
+
+        return (
+            not high_value_route,
+            not priority_bundle,
+            not auth_only,
+            -score,
+            depth,
+            ep_url,
+        )
+
+    prioritized_endpoints = sorted(discovered_endpoints, key=_static_endpoint_priority)
+
+    for idx, ep in enumerate(prioritized_endpoints):
         ep_url = endpoint_url(ep)
         ep_kind = endpoint_kind(ep)
         intensity = choose_probe_intensity_for_endpoint(idx, ep)
@@ -1394,6 +1423,8 @@ async def llm_judge_if_enabled(candidate: Dict[str, Any], snapshot: Dict[str, An
     original_severity = candidate.get("severity")
     original_cwe = candidate.get("cwe")
     original_exposed = list(candidate.get("exposed_information") or [])
+    original_raw_exposed = list(candidate.get("exposed_information_raw") or [])
+    original_subtype = str(candidate.get("subtype") or "")
 
     try:
         judged = await asyncio.to_thread(judge_candidate, candidate, snapshot)
@@ -1724,6 +1755,7 @@ async def llm_judge_if_enabled(candidate: Dict[str, Any], snapshot: Dict[str, An
         candidate["severity_reason"] = []
 
     else:
+        sanitized_exposed = None
         normalize_types = {
             "DEFAULT_FILE_EXPOSED",
             "OPEN_REDIRECT",
@@ -1774,6 +1806,15 @@ async def llm_judge_if_enabled(candidate: Dict[str, Any], snapshot: Dict[str, An
 
     if not candidate.get("exposed_information"):
         candidate["exposed_information"] = _dedup_keep_order(original_exposed, limit=6)
+
+    if candidate_type == "HTTP_SYSTEM_INFO_EXPOSURE" and original_subtype == "client_bundle_source_map_or_config":
+        candidate["exposed_information_raw"] = _dedup_keep_order(
+            original_raw_exposed + ([str(x).strip() for x in raw_exposed] if isinstance(raw_exposed, list) else []),
+            limit=16,
+        )
+        if not candidate.get("exposed_information") or candidate.get("exposed_information") == sanitized_exposed:
+            candidate["exposed_information"] = _dedup_keep_order(original_exposed, limit=10)
+        candidate["severity_reason"] = []
 
     if judged.get("safe_verification_requests"):
         candidate["llm_suggested_verification_requests"] = judged["safe_verification_requests"]
