@@ -1692,6 +1692,7 @@ async def process_plan(
     request_auth_state: str = "inherit",
     shared_unhealthy_scopes: set[str] | None = None,
     auth_deadline_monotonic: float | None = None,
+    progress_callback=None,
 ) -> Dict[str, Any]:
     confirmed_map: Dict[str, Dict[str, Any]] = {}
     informational_map: Dict[str, Dict[str, Any]] = {}
@@ -2492,6 +2493,22 @@ async def process_plan(
                         informational_map=informational_map,
                         false_positive_map=false_positive_map,
                     )
+
+        if progress_callback is not None:
+            try:
+                await progress_callback(
+                    confirmed_map=confirmed_map,
+                    informational_map=informational_map,
+                    false_positive_map=false_positive_map,
+                    request_failures=request_failures,
+                    processed_count=min(len(plan), batch_start + len(batch_specs)),
+                    total_count=len(plan),
+                    batch_size=len(batch_specs),
+                    next_seq=seq,
+                    auth_session_budget_exhausted=auth_budget_exhausted,
+                )
+            except Exception as e:
+                log_fn("LIVE", f"Progress callback failed: {type(e).__name__}: {e}")
 
     confirmed_items = apply_combination_severity(list(confirmed_map.values()))
     informational_items = apply_combination_severity(list(informational_map.values()))

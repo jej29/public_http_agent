@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -11,7 +12,7 @@ from urllib.parse import urlparse, urlsplit
 import httpx
 from agent.candidates import generate_candidates
 from agent.findings.identity import stable_key
-from agent.core.common import log, now_utc_iso, run_id_utc, save_json
+from agent.core.common import log, now_utc_iso, prune_empty, run_id_utc, save_json
 from agent.crawler import discover_endpoints
 from agent.analysis.features import extract_features
 from agent.findings.types import (
@@ -144,7 +145,36 @@ async def _run_plan_and_merge(
     request_failures: List[Dict[str, Any]],
     shared_unhealthy_scopes: set[str] | None = None,
     auth_deadline_monotonic: float | None = None,
+    live_progress_callback=None,
 ) -> int:
+    async def _progress_callback(**progress_state: Any) -> None:
+        if live_progress_callback is None:
+            return
+
+        merged_confirmed = dict(confirmed_map)
+        merged_informational = dict(informational_map)
+        merged_false_positive = dict(false_positive_map)
+        merged_request_failures = list(request_failures)
+
+        _merge_bucket_maps(progress_state.get("confirmed_map") or {}, merged_confirmed)
+        _merge_bucket_maps(progress_state.get("informational_map") or {}, merged_informational)
+        _merge_bucket_maps(progress_state.get("false_positive_map") or {}, merged_false_positive)
+        merged_request_failures.extend(progress_state.get("request_failures") or [])
+
+        await live_progress_callback(
+            confirmed_map=merged_confirmed,
+            informational_map=merged_informational,
+            false_positive_map=merged_false_positive,
+            request_failures=merged_request_failures,
+            progress={
+                "processed_count": progress_state.get("processed_count"),
+                "total_count": progress_state.get("total_count"),
+                "batch_size": progress_state.get("batch_size"),
+                "next_seq": progress_state.get("next_seq"),
+                "auth_session_budget_exhausted": progress_state.get("auth_session_budget_exhausted"),
+            },
+        )
+
     process_result = await process_plan(
         client=client,
         plan=plan,
@@ -163,6 +193,7 @@ async def _run_plan_and_merge(
         request_auth_state="authenticated" if authenticated else "anonymous",
         shared_unhealthy_scopes=shared_unhealthy_scopes,
         auth_deadline_monotonic=auth_deadline_monotonic,
+        progress_callback=_progress_callback if live_progress_callback is not None else None,
     )
 
     _merge_process_result(
@@ -196,6 +227,124 @@ def _merge_process_result(
     _merge_bucket_maps(process_result["informational_map"], informational_map)
     _merge_bucket_maps(process_result["false_positive_map"], false_positive_map)
     request_failures.extend(process_result["request_failures"])
+
+
+def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(prune_empty(data), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
+
+def _count_live_values(items: List[Dict[str, Any]], field: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in items or []:
+        raw_value = item.get(field)
+        key = str(raw_value).strip() if raw_value not in (None, "") else "<missing>"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _last_observed_url(raw_index: List[Dict[str, Any]]) -> str | None:
+    for item in reversed(raw_index or []):
+        for key in ("final_url", "url"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                return value
+    return None
+
+
+def _build_live_status_payload(
+    *,
+    results: Dict[str, Any],
+    raw_index: List[Dict[str, Any]],
+    request_failures: List[Dict[str, Any]],
+    confirmed_map: Dict[str, Dict[str, Any]],
+    informational_map: Dict[str, Dict[str, Any]],
+    false_positive_map: Dict[str, Dict[str, Any]],
+    phase: str,
+    elapsed_seconds: float,
+    progress: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    metadata = results.get("metadata") or {}
+    auth_state_loss_count = sum(
+        1
+        for item in request_failures or []
+        if str(item.get("error_class") or "").strip() == "AuthStateLoss"
+    )
+
+    payload: Dict[str, Any] = {
+        "phase": phase,
+        "started_at": metadata.get("started_at"),
+        "elapsed_seconds": round(max(0.0, elapsed_seconds), 3),
+        "target": metadata.get("target"),
+        "authenticated": bool(metadata.get("authenticated")),
+        "auth_landing_url": metadata.get("auth_landing_url"),
+        "auth_state_loss_count": auth_state_loss_count,
+        "requests_done": len(raw_index or []),
+        "last_url": _last_observed_url(raw_index),
+        "status_code_counts": _count_live_values(raw_index, "status_code"),
+        "auth_state_counts": _count_live_values(raw_index, "auth_state"),
+        "family_counts": _count_live_values(raw_index, "family"),
+        "findings_so_far": {
+            "confirmed": len(confirmed_map or {}),
+            "informational": len(informational_map or {}),
+            "false_positive": len(false_positive_map or {}),
+        },
+    }
+    if progress:
+        payload["progress"] = progress
+    return payload
+
+
+def _append_live_findings(
+    *,
+    live_findings_path: Path,
+    phase: str,
+    finding_hashes: Dict[str, str],
+    confirmed_map: Dict[str, Dict[str, Any]],
+    informational_map: Dict[str, Dict[str, Any]],
+    false_positive_map: Dict[str, Dict[str, Any]],
+) -> None:
+    updates: List[str] = []
+    buckets = (
+        ("confirmed", confirmed_map),
+        ("informational", informational_map),
+        ("false_positive", false_positive_map),
+    )
+
+    for bucket_name, bucket_map in buckets:
+        for finding_key, finding in (bucket_map or {}).items():
+            finding_payload = prune_empty(dict(finding or {}))
+            fingerprint = json.dumps(finding_payload, ensure_ascii=False, sort_keys=True)
+            hash_key = f"{bucket_name}:{finding_key}"
+            if finding_hashes.get(hash_key) == fingerprint:
+                continue
+            finding_hashes[hash_key] = fingerprint
+            updates.append(
+                json.dumps(
+                    {
+                        "event": "upsert",
+                        "bucket": bucket_name,
+                        "stable_key": finding_key,
+                        "phase": phase,
+                        "updated_at": now_utc_iso(),
+                        "finding": finding_payload,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    if not updates:
+        return
+
+    live_findings_path.parent.mkdir(parents=True, exist_ok=True)
+    with live_findings_path.open("a", encoding="utf-8") as f:
+        for line in updates:
+            f.write(line + "\n")
 
 def _path_prefixes_from_url(url: str) -> List[str]:
     path = urlsplit(url).path or "/"
@@ -1178,6 +1327,20 @@ def _sanitize_llm_exposed_information(candidate: Dict[str, Any], raw_items: List
             "framework_hint_in_body": {"framework"},
             "debug_marker_in_body": {"debug"},
             "internal_ip_in_body": {"internal ip", "internal", "ip"},
+            "client_bundle_source_map_or_config": {
+                "webpack:///",
+                "sourceurl",
+                "sourcemappingurl",
+                "console.trace",
+                "productgroupid",
+                "productid",
+                "productphase",
+                "rumservertype",
+                "applicationservers",
+                "loglevel",
+                "http://",
+                "https://",
+            },
         }
 
         expected = subtype_rules.get(subtype)
@@ -2509,8 +2672,13 @@ async def run_scan(
     base_out_dir = requested_out.parent
     run_dir = base_out_dir / run_id
     ensure_output_dirs(run_dir)
+    live_dir = run_dir / "live"
+    live_status_path = live_dir / "scan_status.json"
+    live_findings_path = live_dir / "findings_live.jsonl"
+    live_finding_hashes: Dict[str, str] = {}
 
     out_path = run_dir / "results.json"
+    scan_started_monotonic = time.monotonic()
 
     limits = httpx.Limits(
         max_connections=concurrency,
@@ -2616,6 +2784,47 @@ async def run_scan(
         authenticated_endpoints: List[Dict[str, Any]] = []
         protected_resource_findings: List[Dict[str, Any]] = []
 
+        async def _flush_live_progress(
+            phase: str,
+            *,
+            confirmed_override: Dict[str, Dict[str, Any]] | None = None,
+            informational_override: Dict[str, Dict[str, Any]] | None = None,
+            false_positive_override: Dict[str, Dict[str, Any]] | None = None,
+            request_failures_override: List[Dict[str, Any]] | None = None,
+            progress: Dict[str, Any] | None = None,
+        ) -> None:
+            effective_confirmed = confirmed_override if confirmed_override is not None else confirmed_map
+            effective_informational = informational_override if informational_override is not None else informational_map
+            effective_false_positive = false_positive_override if false_positive_override is not None else false_positive_map
+            effective_request_failures = (
+                request_failures_override if request_failures_override is not None else request_failures
+            )
+
+            _write_json_atomic(
+                live_status_path,
+                _build_live_status_payload(
+                    results=results,
+                    raw_index=raw_index,
+                    request_failures=effective_request_failures,
+                    confirmed_map=effective_confirmed,
+                    informational_map=effective_informational,
+                    false_positive_map=effective_false_positive,
+                    phase=phase,
+                    elapsed_seconds=time.monotonic() - scan_started_monotonic,
+                    progress=progress,
+                ),
+            )
+            _append_live_findings(
+                live_findings_path=live_findings_path,
+                phase=phase,
+                finding_hashes=live_finding_hashes,
+                confirmed_map=effective_confirmed,
+                informational_map=effective_informational,
+                false_positive_map=effective_false_positive,
+            )
+
+        await _flush_live_progress("initializing")
+
         log("CRAWL", f"Discovering anonymous endpoints from seed: {target}")
         anonymous_endpoints = await discover_endpoints(
             client=client,
@@ -2626,6 +2835,10 @@ async def run_scan(
             include_js_string_paths=crawl_enable_js,
             extra_seed_urls=seed_urls or [],
             crawl_state="anonymous",
+        )
+        await _flush_live_progress(
+            "anonymous_crawl_complete",
+            progress={"discovered_anonymous_endpoints": len(anonymous_endpoints or [])},
         )
 
         manual_auth_enabled = bool(manual_auth_meta.get("manual_auth_enabled"))
@@ -2728,11 +2941,19 @@ async def run_scan(
 
                 results["metadata"]["auth_events"] = auth_events
                 results["metadata"]["auth_cookie_observations"] = auth_cookie_observations
+                await _flush_live_progress(
+                    "authentication_complete",
+                    progress={"auth_snapshot_count": auth_snapshot_count},
+                )
 
             except Exception as e:
                 log("AUTH", f"Authentication failed: {type(e).__name__}: {e}")
                 authenticated = False
                 auth_landing_url = None
+                await _flush_live_progress(
+                    "authentication_failed",
+                    progress={"error": f"{type(e).__name__}: {e}"},
+                )
 
         allowed_app_prefixes = derive_allowed_app_prefixes(
             target=target,
@@ -2762,6 +2983,10 @@ async def run_scan(
                 crawl_depth=crawl_depth,
                 crawl_max_pages=crawl_max_pages,
                 crawl_enable_js=crawl_enable_js,
+            )
+            await _flush_live_progress(
+                "authenticated_crawl_complete",
+                progress={"discovered_authenticated_endpoints": len(authenticated_endpoints or [])},
             )
 
         if authenticated and auth_result:
@@ -2797,6 +3022,10 @@ async def run_scan(
                 shared_unhealthy_scopes=shared_unhealthy_scopes,
                 probe_metadata=authenticated_business_probe_targets,
                 auth_deadline_monotonic=auth_deadline_monotonic,
+            )
+            await _flush_live_progress(
+                "authenticated_business_probes_complete",
+                progress={"selected_probe_targets": len(authenticated_business_probe_targets or [])},
             )
         elif authenticated and http_only_mode:
             log("AUTH", "Authenticated business probes skipped: HTTP_ONLY_MODE=true")
@@ -2840,6 +3069,15 @@ async def run_scan(
             static_plan_a = static_plan[:split_idx]
             static_plan_b = static_plan[split_idx:]
 
+        await _flush_live_progress(
+            "planning_complete",
+            progress={
+                "discovered_endpoints": len(discovered_endpoints or []),
+                "static_plan_a_count": len(static_plan_a),
+                "static_plan_b_count": len(static_plan_b),
+            },
+        )
+
         next_seq = await _run_plan_and_merge(
             client=client,
             plan=static_plan_a,
@@ -2856,7 +3094,16 @@ async def run_scan(
             request_failures=request_failures,
             shared_unhealthy_scopes=shared_unhealthy_scopes,
             auth_deadline_monotonic=auth_deadline_monotonic,
+            live_progress_callback=lambda **state: _flush_live_progress(
+                "static_plan_a",
+                confirmed_override=state.get("confirmed_map"),
+                informational_override=state.get("informational_map"),
+                false_positive_override=state.get("false_positive_map"),
+                request_failures_override=state.get("request_failures"),
+                progress=state.get("progress"),
+            ),
         )
+        await _flush_live_progress("static_plan_a_complete")
 
         async def _run_llm_planner_round(round_name: str, seq_start_val: int) -> int:
             nonlocal confirmed_map, informational_map, false_positive_map, request_failures
@@ -2903,6 +3150,14 @@ async def run_scan(
                 request_failures=request_failures,
                 shared_unhealthy_scopes=shared_unhealthy_scopes,
                 auth_deadline_monotonic=auth_deadline_monotonic,
+                live_progress_callback=lambda **state: _flush_live_progress(
+                    f"llm_planner_{round_name}",
+                    confirmed_override=state.get("confirmed_map"),
+                    informational_override=state.get("informational_map"),
+                    false_positive_override=state.get("false_positive_map"),
+                    request_failures_override=state.get("request_failures"),
+                    progress=state.get("progress"),
+                ),
             )
 
         if llm_planner_enabled:
@@ -2924,7 +3179,16 @@ async def run_scan(
             request_failures=request_failures,
             shared_unhealthy_scopes=shared_unhealthy_scopes,
             auth_deadline_monotonic=auth_deadline_monotonic,
+            live_progress_callback=lambda **state: _flush_live_progress(
+                "static_plan_b",
+                confirmed_override=state.get("confirmed_map"),
+                informational_override=state.get("informational_map"),
+                false_positive_override=state.get("false_positive_map"),
+                request_failures_override=state.get("request_failures"),
+                progress=state.get("progress"),
+            ),
         )
+        await _flush_live_progress("static_plan_b_complete")
 
         if llm_planner_enabled:
             next_seq = await _run_llm_planner_round("final", next_seq)
@@ -2985,6 +3249,7 @@ async def run_scan(
                 }
                 if http_only_mode:
                     log("AUTH", "Endpoint ACL replay skipped: HTTP_ONLY_MODE=true")
+            await _flush_live_progress("endpoint_acl_replay_complete")
 
             if enable_request_acl_replay:
                 next_seq, request_replay_meta = await _run_request_access_control_replay(
@@ -3012,6 +3277,7 @@ async def run_scan(
                 }
                 if http_only_mode:
                     log("AUTH", "Request ACL replay skipped: HTTP_ONLY_MODE=true")
+            await _flush_live_progress("request_acl_replay_complete")
 
             if enable_object_acl_replay:
                 next_seq, object_replay_meta = await _run_object_access_control_replay(
@@ -3058,6 +3324,7 @@ async def run_scan(
                 protected_resource_findings = []
                 if http_only_mode:
                     log("AUTH", "Object ACL replay skipped: HTTP_ONLY_MODE=true")
+            await _flush_live_progress("object_acl_replay_complete")
 
             store_verified_findings(
                 findings=protected_resource_findings,
@@ -3085,6 +3352,9 @@ async def run_scan(
             request_failures=request_failures,
             seq_start=next_seq,
         )
+        await _flush_live_progress("differential_replay_complete")
+
+        await _flush_live_progress("finalizing")
 
         finalize_and_write_results(
             results=results,
@@ -3112,6 +3382,17 @@ async def run_scan(
             log_fn=log,
             save_json_fn=save_json,
             generate_reports_fn=generate_reports,
+        )
+        await _flush_live_progress(
+            "completed",
+            confirmed_override={stable_key(item): item for item in (results.get("findings_confirmed") or [])},
+            informational_override={stable_key(item): item for item in (results.get("findings_informational") or [])},
+            false_positive_override={stable_key(item): item for item in (results.get("findings_false_positive") or [])},
+            progress={
+                "confirmed_count": len(results.get("findings_confirmed") or []),
+                "informational_count": len(results.get("findings_informational") or []),
+                "false_positive_count": len(results.get("findings_false_positive") or []),
+            },
         )
 
     return 0

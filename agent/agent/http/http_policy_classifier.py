@@ -300,6 +300,9 @@ def _build_cookie_signals(
             "response_kind": response_kind,
             "cookie": raw,
             "cookie_name": name,
+            "set_cookie_header": raw,
+            "set_cookie_headers": feats.get("set_cookie_headers") or [],
+            "request_cookie_header": feats.get("request_cookie_header") or "",
             "cookie_prefix": prefix,
             "cookie_sensitive": sensitive_cookie,
             "cookie_persistent": bool(cookie.get("persistent")),
@@ -361,6 +364,8 @@ def _build_cookie_signals(
                 evidence={
                     "response_kind": response_kind,
                     "cookie_name": cookie_name,
+                    "request_cookie_header": feats.get("request_cookie_header") or "",
+                    "request_sensitive_cookie_names_raw": sorted(request_sensitive_cookie_names),
                     "cookie_sensitive": True,
                     "auth_context": auth_context,
                     "request_sensitive_cookie_names": sorted(request_sensitive_cookie_names),

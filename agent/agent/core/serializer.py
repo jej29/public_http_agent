@@ -452,6 +452,14 @@ def _build_compact_evidence_summary(finding: Dict[str, Any]) -> Dict[str, Any]:
 
     if evidence.get("internal_ips"):
         summary["internal_ips"] = _dedup_str_list(evidence.get("internal_ips") or [], limit=5)
+    if evidence.get("source_map_markers"):
+        summary["source_map_markers"] = _dedup_str_list(evidence.get("source_map_markers") or [], limit=8)
+    if evidence.get("client_side_urls"):
+        summary["client_side_urls"] = _dedup_str_list(evidence.get("client_side_urls") or [], limit=8)
+    if evidence.get("debug_or_config_tokens"):
+        summary["debug_or_config_tokens"] = _dedup_str_list(evidence.get("debug_or_config_tokens") or [], limit=8)
+    if evidence.get("bundle_evidence_snippets"):
+        summary["bundle_evidence_snippets"] = _dedup_str_list(evidence.get("bundle_evidence_snippets") or [], limit=8)
     if evidence.get("writable_paths"):
         summary["writable_paths"] = _dedup_str_list(evidence.get("writable_paths") or [], limit=5)
     if evidence.get("setup_diagnostic_values"):
@@ -538,9 +546,11 @@ def _build_compact_evidence_summary(finding: Dict[str, Any]) -> Dict[str, Any]:
     if evidence.get("notes"):
         summary["notes"] = _dedup_str_list(evidence.get("notes") or [], limit=8)
 
-    for field in ["acao", "acac", "acam", "acah", "vary", "location", "cookie_name"]:
+    for field in ["acao", "acac", "acam", "acah", "vary", "location", "cookie_name", "cookie", "set_cookie_header", "request_cookie_header"]:
         if evidence.get(field) not in (None, "", [], {}):
             summary[field] = evidence.get(field)
+    if evidence.get("set_cookie_headers"):
+        summary["set_cookie_headers"] = _dedup_str_list(evidence.get("set_cookie_headers") or [], limit=8)
 
     # protected resource exposure summary
     protected_fields = (

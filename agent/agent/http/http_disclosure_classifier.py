@@ -348,6 +348,21 @@ def _extract_client_bundle_disclosure_markers(body: str) -> Dict[str, List[str]]
             debug_tokens.append(token)
     debug_tokens = _dedup(debug_tokens)[:8]
 
+    snippets: List[str] = []
+    snippet_patterns = [
+        r"(?:sourceURL|sourceMappingURL)=webpack:///[^\n\r\"']{0,220}",
+        r"webpack:///[^\n\r\"']*?/src/[^\n\r\"']{0,220}",
+        r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{0,220}",
+        r".{0,80}console\.trace.{0,120}",
+        r".{0,80}(?:productgroupid|productid|productphase|rumservertype|applicationservers|loglevel).{0,120}",
+    ]
+    for pattern in snippet_patterns:
+        for item in re.findall(pattern, text, re.I):
+            value = str(item or "").strip()
+            if value:
+                snippets.append(value)
+    snippets = _dedup(snippets)[:10]
+
     out: Dict[str, List[str]] = {}
     if source_markers:
         out["source_map_markers"] = source_markers
@@ -355,6 +370,8 @@ def _extract_client_bundle_disclosure_markers(body: str) -> Dict[str, List[str]]
         out["client_side_urls"] = external_urls
     if debug_tokens and (external_urls or source_markers):
         out["debug_or_config_tokens"] = debug_tokens
+    if snippets:
+        out["bundle_evidence_snippets"] = snippets
     return out
 
 
@@ -588,6 +605,7 @@ def _build_static_client_bundle_disclosure_signals(
     source_markers = markers.get("source_map_markers") or []
     urls = markers.get("client_side_urls") or []
     debug_tokens = markers.get("debug_or_config_tokens") or []
+    snippets = markers.get("bundle_evidence_snippets") or []
 
     exposed_information: List[str] = []
     if source_markers:
@@ -617,6 +635,7 @@ def _build_static_client_bundle_disclosure_signals(
             "source_map_markers": source_markers,
             "client_side_urls": urls,
             "debug_or_config_tokens": debug_tokens,
+            "bundle_evidence_snippets": snippets,
             "technology_fingerprint": technology_fingerprint,
         },
         exposed_information=exposed_information[:6],
@@ -637,6 +656,7 @@ def _build_static_client_bundle_disclosure_signals(
             "verification_strategy": "single_observation",
         }
     )
+    signal["exposed_information_raw"] = _dedup(source_markers + urls + debug_tokens + snippets)[:16]
     return [
         signal
     ]

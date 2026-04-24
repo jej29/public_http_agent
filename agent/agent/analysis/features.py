@@ -1087,6 +1087,26 @@ def _extract_request_cookie_names(snapshot: Dict[str, Any]) -> List[str]:
     return names
 
 
+def _extract_request_cookie_header(snapshot: Dict[str, Any]) -> str:
+    request_blocks = [
+        snapshot.get("actual_request") or {},
+        snapshot.get("request") or {},
+    ]
+
+    for req in request_blocks:
+        if not isinstance(req, dict):
+            continue
+        headers = req.get("headers") or {}
+        if not isinstance(headers, dict):
+            continue
+        for k, v in headers.items():
+            if str(k).lower().strip() == "cookie":
+                value = str(v or "").strip()
+                if value:
+                    return value
+    return ""
+
+
 def _looks_like_non_sensitive_context_cookie(name: str) -> bool:
     n = str(name or "").strip().lower()
     if not n:
@@ -1194,6 +1214,7 @@ def _extract_cookie_objects(snapshot: Dict[str, Any], headers_lc: Dict[str, Any]
     is_https = _is_https_url(final_url)
 
     request_cookie_names = _extract_request_cookie_names(snapshot)
+    request_cookie_header = _extract_request_cookie_header(snapshot)
     request_cookie_name_set = {str(x).strip().lower() for x in request_cookie_names if str(x).strip()}
 
     def _build_cookie_row(
@@ -1262,6 +1283,8 @@ def _extract_cookie_objects(snapshot: Dict[str, Any], headers_lc: Dict[str, Any]
             "set_cookie_observed": bool(cookie_objects),
             "cookies": cookie_objects,
             "request_cookie_names": request_cookie_names,
+            "request_cookie_header": request_cookie_header,
+            "set_cookie_headers": [str(item.get("raw") or "").strip() for item in cookie_objects if str(item.get("raw") or "").strip()],
         }
 
     raw_cookies = _header_all(headers_lc, "set-cookie")
@@ -1287,6 +1310,8 @@ def _extract_cookie_objects(snapshot: Dict[str, Any], headers_lc: Dict[str, Any]
         "set_cookie_observed": bool(raw_cookies),
         "cookies": cookie_objects,
         "request_cookie_names": request_cookie_names,
+        "request_cookie_header": request_cookie_header,
+        "set_cookie_headers": [str(item) for item in raw_cookies if str(item).strip()],
     }
 
 def _extract_allowed_methods(headers_lc: Dict[str, Any]) -> List[str]:
@@ -2109,6 +2134,8 @@ def extract_features(request_meta: Dict[str, Any], snapshot: Dict[str, Any]) -> 
         "set_cookie_observed": cookie_info["set_cookie_observed"],
         "cookie_objects": cookie_info["cookies"],
         "request_cookie_names": request_cookie_names,
+        "request_cookie_header": cookie_info.get("request_cookie_header") or "",
+        "set_cookie_headers": cookie_info.get("set_cookie_headers") or [],
         "request_sensitive_cookie_names": request_sensitive_cookie_names,
         "response_cookie_names": response_cookie_names,
         "request_sensitive_cookie_names_missing_in_response": request_sensitive_cookie_names_missing_in_response,
