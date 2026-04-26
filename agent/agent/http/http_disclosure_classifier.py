@@ -21,6 +21,38 @@ def _dedup(items: List[str]) -> List[str]:
     return out
 
 
+def _clip_context_snippet(value: str, limit: int = 700) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.replace("\r", "")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def _collect_context_snippets(
+    text: str,
+    patterns: List[str],
+    *,
+    before: int = 160,
+    after: int = 520,
+    limit: int = 6,
+) -> List[str]:
+    snippets: List[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.I | re.S):
+            start = max(0, match.start() - before)
+            end = min(len(text), match.end() + after)
+            snippet = _clip_context_snippet(text[start:end])
+            if snippet:
+                snippets.append(snippet)
+            if len(snippets) >= limit:
+                return _dedup(snippets)[:limit]
+    return _dedup(snippets)[:limit]
+
+
 def _clean_disclosure_text(value: str) -> str:
     text = html.unescape(str(value or "")).replace("\ufffd", "").strip()
     text = re.sub(r"\s+", " ", text)
@@ -363,6 +395,23 @@ def _extract_client_bundle_disclosure_markers(body: str) -> Dict[str, List[str]]
                 snippets.append(value)
     snippets = _dedup(snippets)[:10]
 
+    runtime_config_snippets = _collect_context_snippets(
+        text,
+        [
+            r"console\.trace\([^)]{0,160}\).*?ApmVuePlugin.{0,260}",
+            r"let\s+config\s*=\s*\{.*?(?:ApmVuePlugin|addLabels)\s*\(",
+            r"serverUrl\s*:\s*[\"']https?://[^\"']+[\"'].*?distributedTracingOrigins\s*:\s*applicationServers",
+            r"productgroupid.*?productphase.*?applicationServers.*?logLevel",
+            r"addLabels\(\{[\"']productgroupid[\"']\s*:\s*productgroupid\}\).*?ApmVuePlugin",
+            r"sourceURL=webpack:///\.\/node_modules/@artifact/rum-vue2/index\.js\?.{0,420}",
+            r"sourceURL=webpack:///\.\/node_modules/@elastic/apm-rum-core/dist/es/common/context\.js\?.{0,420}",
+            r"sourceURL=webpack:///\.\/node_modules/@elastic/apm-rum-core/dist/es/common/utils\.js\?.{0,420}",
+        ],
+        before=120,
+        after=600,
+        limit=6,
+    )
+
     out: Dict[str, List[str]] = {}
     if source_markers:
         out["source_map_markers"] = source_markers
@@ -372,6 +421,8 @@ def _extract_client_bundle_disclosure_markers(body: str) -> Dict[str, List[str]]
         out["debug_or_config_tokens"] = debug_tokens
     if snippets:
         out["bundle_evidence_snippets"] = snippets
+    if runtime_config_snippets:
+        out["runtime_config_snippets"] = runtime_config_snippets
     return out
 
 
@@ -606,14 +657,26 @@ def _build_static_client_bundle_disclosure_signals(
     urls = markers.get("client_side_urls") or []
     debug_tokens = markers.get("debug_or_config_tokens") or []
     snippets = markers.get("bundle_evidence_snippets") or []
+    runtime_config_snippets = markers.get("runtime_config_snippets") or []
 
     exposed_information: List[str] = []
     if source_markers:
         exposed_information.append("Webpack source map/sourceURL module paths are present in the client bundle")
     if urls:
+        if any("apm.elastic" in item.lower() for item in urls):
+            exposed_information.append("Elastic APM server URL is exposed in the client bundle")
         exposed_information.extend([f"Client-side URL: {item}" for item in urls[:3]])
     if debug_tokens:
+        if any(
+            token in debug_tokens
+            for token in ("productgroupid", "productid", "productphase", "rumservertype", "applicationservers", "loglevel")
+        ):
+            exposed_information.append(
+                "Runtime configuration values such as productgroupid, productid, productphase, rumServerType, applicationServers, and logLevel are present in the client bundle"
+            )
         exposed_information.append("Client-side debug/config tokens are present: " + ", ".join(debug_tokens[:6]))
+    if runtime_config_snippets:
+        exposed_information.append("Source code snippets reveal runtime configuration blocks and console.trace-based debug logging")
     exposed_information = _dedup(exposed_information)
     if not exposed_information:
         return []
@@ -636,6 +699,7 @@ def _build_static_client_bundle_disclosure_signals(
             "client_side_urls": urls,
             "debug_or_config_tokens": debug_tokens,
             "bundle_evidence_snippets": snippets,
+            "runtime_config_snippets": runtime_config_snippets,
             "technology_fingerprint": technology_fingerprint,
         },
         exposed_information=exposed_information[:6],
@@ -656,7 +720,9 @@ def _build_static_client_bundle_disclosure_signals(
             "verification_strategy": "single_observation",
         }
     )
-    signal["exposed_information_raw"] = _dedup(source_markers + urls + debug_tokens + snippets)[:16]
+    signal["exposed_information_raw"] = _dedup(
+        runtime_config_snippets + source_markers + urls + debug_tokens + snippets
+    )[:20]
     return [
         signal
     ]

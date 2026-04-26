@@ -460,6 +460,15 @@ def _build_compact_evidence_summary(finding: Dict[str, Any]) -> Dict[str, Any]:
         summary["debug_or_config_tokens"] = _dedup_str_list(evidence.get("debug_or_config_tokens") or [], limit=8)
     if evidence.get("bundle_evidence_snippets"):
         summary["bundle_evidence_snippets"] = _dedup_str_list(evidence.get("bundle_evidence_snippets") or [], limit=8)
+    if evidence.get("runtime_config_snippets"):
+        summary["runtime_config_snippets"] = _dedup_str_list(evidence.get("runtime_config_snippets") or [], limit=6)
+    if (
+        not summary.get("file_paths")
+        and str(finding.get("type") or "") == "HTTP_SYSTEM_INFO_EXPOSURE"
+        and str(finding.get("subtype") or "") == "client_bundle_source_map_or_config"
+        and evidence.get("runtime_config_snippets")
+    ):
+        summary["file_paths"] = _dedup_str_list(evidence.get("runtime_config_snippets") or [], limit=4)
     if evidence.get("writable_paths"):
         summary["writable_paths"] = _dedup_str_list(evidence.get("writable_paths") or [], limit=5)
     if evidence.get("setup_diagnostic_values"):
