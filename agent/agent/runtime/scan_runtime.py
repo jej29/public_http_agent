@@ -35,6 +35,7 @@ from agent.planning.probes import (
     build_probe_plan,
     build_access_control_replay_plan,
     build_authenticated_request_replay_plan,
+    build_authenticated_high_value_method_probe_plan,
     build_object_access_control_replay_plan,
     build_authenticated_business_probe_plan,
 )
@@ -586,6 +587,36 @@ async def _run_authenticated_business_probes(
 ) -> int:
     if not authenticated:
         return seq_start
+
+    high_value_method_plan = build_authenticated_high_value_method_probe_plan(
+        authenticated_endpoints=authenticated_endpoints or [],
+        anonymous_endpoints=anonymous_endpoints or [],
+    )
+    if high_value_method_plan:
+        high_value_method_plan = filter_request_specs_by_app_scope(
+            high_value_method_plan,
+            base_target=target,
+            allowed_prefixes=allowed_app_prefixes,
+        )
+    if high_value_method_plan:
+        log("AUTH", f"Running authenticated high-value method probes against {len(high_value_method_plan)} requests")
+        seq_start = await _run_plan_and_merge(
+            client=client,
+            plan=high_value_method_plan,
+            timeout_s=timeout_s,
+            retries=retries,
+            run_dir=run_dir,
+            raw_index=raw_index,
+            coverage=coverage,
+            seq_start=seq_start,
+            authenticated=True,
+            confirmed_map=confirmed_map,
+            informational_map=informational_map,
+            false_positive_map=false_positive_map,
+            request_failures=request_failures,
+            shared_unhealthy_scopes=shared_unhealthy_scopes,
+            auth_deadline_monotonic=auth_deadline_monotonic,
+        )
 
     auth_business_plan = build_authenticated_business_probe_plan(
         authenticated_endpoints=authenticated_endpoints or [],

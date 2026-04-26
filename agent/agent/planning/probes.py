@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit, urlencode
 from agent.core.scope import normalize_url_for_dedup
@@ -1012,6 +1012,100 @@ def _risky_method_specs(target_url: str, headers: Dict[str, str]) -> List[Reques
         )
         for method, mclass in methods
     ]
+
+
+def _is_high_value_authenticated_method_target(url: str) -> bool:
+    path_l = (urlsplit(str(url or "")).path or "/").lower()
+    return any(
+        token in path_l
+        for token in (
+            "/admin",
+            "/admission",
+            "/acadmgmt",
+            "/api/",
+            "/rest/",
+            "/common",
+            ".do",
+            ".action",
+            ".jsp",
+        )
+    )
+
+
+def build_authenticated_high_value_method_probe_plan(
+    *,
+    authenticated_endpoints: List[Dict[str, object]],
+    anonymous_endpoints: Optional[List[Dict[str, object]]] = None,
+    max_targets: Optional[int] = None,
+) -> List[RequestSpec]:
+    headers = _base_headers()
+    seen = set()
+    plan: List[RequestSpec] = []
+
+    if max_targets is None:
+        max_targets = int(os.getenv("AUTHENTICATED_HIGH_VALUE_METHOD_PROBE_MAX_TARGETS", "6"))
+
+    anonymous_norm_paths = {
+        _normalize_replay_key(str(ep.get("url") or "").strip())
+        for ep in (anonymous_endpoints or [])
+        if isinstance(ep, dict) and str(ep.get("url") or "").strip()
+    }
+
+    ranked: List[tuple[int, str]] = []
+    seen_urls = set()
+    for ep in authenticated_endpoints or []:
+        if not isinstance(ep, dict):
+            continue
+        url = str(ep.get("url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        if not _is_high_value_authenticated_method_target(url):
+            continue
+        if _request_replay_is_static_like(url) or _is_auth_flow_path(url):
+            continue
+        path = (urlsplit(url).path or "/").lower()
+        score = int(ep.get("score", 0) or 0)
+        score += _sensitive_path_score(url)
+        if _normalize_replay_key(url) not in anonymous_norm_paths:
+            score += 15
+        if "/admin/acadmgmt" in path:
+            score += 40
+        elif "/admin/admission" in path:
+            score += 35
+        elif path.rstrip("/") == "/admin":
+            score += 30
+        elif "/admin/" in path:
+            score += 20
+        elif any(tok in path for tok in ("/api/", "/rest/", "/common")):
+            score += 10
+        ranked.append((score, url))
+
+    ranked.sort(key=lambda item: (-item[0], len(urlsplit(item[1]).path or "/"), item[1]))
+
+    target_count = 0
+    for priority, url in ranked:
+        replay_key = _normalize_replay_key(url)
+        method_specs = _risky_method_specs(url, headers)
+        for spec in method_specs:
+            if spec.method not in {"PROPFIND", "PATCH"}:
+                continue
+            auth_spec = replace(
+                spec,
+                source="authenticated_priority_method_probe",
+                auth_state="authenticated",
+                replay_key=replay_key,
+                replay_source_url=url,
+                replay_source_state="authenticated",
+                replay_priority=priority,
+            )
+            _append_unique(plan, seen, auth_spec)
+        if plan:
+            target_count += 1
+        if target_count >= max_targets:
+            break
+
+    return plan
 
 def _trace_echo_spec(target_url: str, headers: Dict[str, str]) -> RequestSpec:
     trace_marker = f"TRACE_MARKER_{rand_suffix(10)}"
@@ -3158,11 +3252,23 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
             if count >= limit or len(plan) >= total_budget:
                 break
 
-    add_limited(_baseline_specs(with_slash, headers), category_limits["baseline"])
-    add_limited(_notfound_specs(base, headers), category_limits["notfound"])
-    add_limited(_resource_exposure_specs(with_slash, headers, intensity), category_limits["resources"])
-    add_limited(_directory_listing_specs(with_slash, headers, intensity), category_limits["directory"])
-    add_limited(_risky_method_specs(with_slash, headers), category_limits["methods"])
+    high_value_method_target = any(
+        tok in target_path_l
+        for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", "/common", ".do", ".action", ".jsp")
+    )
+
+    if high_value_method_target:
+        add_limited(_risky_method_specs(with_slash, headers), category_limits["methods"])
+        add_limited(_baseline_specs(with_slash, headers), category_limits["baseline"])
+        add_limited(_notfound_specs(base, headers), category_limits["notfound"])
+        add_limited(_resource_exposure_specs(with_slash, headers, intensity), category_limits["resources"])
+        add_limited(_directory_listing_specs(with_slash, headers, intensity), category_limits["directory"])
+    else:
+        add_limited(_baseline_specs(with_slash, headers), category_limits["baseline"])
+        add_limited(_notfound_specs(base, headers), category_limits["notfound"])
+        add_limited(_resource_exposure_specs(with_slash, headers, intensity), category_limits["resources"])
+        add_limited(_directory_listing_specs(with_slash, headers, intensity), category_limits["directory"])
+        add_limited(_risky_method_specs(with_slash, headers), category_limits["methods"])
     add_limited(_cors_specs(with_slash, headers), category_limits["cors"])
 
     if not is_static_mode:
