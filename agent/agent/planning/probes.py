@@ -1043,7 +1043,7 @@ def build_authenticated_high_value_method_probe_plan(
     plan: List[RequestSpec] = []
 
     if max_targets is None:
-        max_targets = int(os.getenv("AUTHENTICATED_HIGH_VALUE_METHOD_PROBE_MAX_TARGETS", "6"))
+        max_targets = int(os.getenv("AUTHENTICATED_HIGH_VALUE_METHOD_PROBE_MAX_TARGETS", "12"))
 
     anonymous_norm_paths = {
         _normalize_replay_key(str(ep.get("url") or "").strip())
@@ -1073,6 +1073,10 @@ def build_authenticated_high_value_method_probe_plan(
             score += 40
         elif "/admin/admission" in path:
             score += 35
+        if any(tok in path for tok in ("uploadexcel", "listuploadexcel", "/excel", "/upload", "/download")):
+            score += 32
+        if "academiccalendar" in path:
+            score += 18
         elif path.rstrip("/") == "/admin":
             score += 30
         elif "/admin/" in path:
@@ -1087,8 +1091,9 @@ def build_authenticated_high_value_method_probe_plan(
     for priority, url in ranked:
         replay_key = _normalize_replay_key(url)
         method_specs = _risky_method_specs(url, headers)
+        added_for_target = False
         for spec in method_specs:
-            if spec.method not in {"PROPFIND", "PATCH"}:
+            if spec.method not in {"OPTIONS", "PROPFIND", "PATCH"}:
                 continue
             auth_spec = replace(
                 spec,
@@ -1100,7 +1105,8 @@ def build_authenticated_high_value_method_probe_plan(
                 replay_priority=priority,
             )
             _append_unique(plan, seen, auth_spec)
-        if plan:
+            added_for_target = True
+        if added_for_target:
             target_count += 1
         if target_count >= max_targets:
             break
