@@ -590,13 +590,6 @@ def validate_candidate_after_llm(candidate: Dict[str, Any]) -> Dict[str, Any]:
                 severity=capped,
             )
 
-        if is_low_value_disclosure(candidate):
-            return _set_informational(
-                candidate,
-                reason="Low-value or weak disclosure signal downgraded to informational.",
-                severity="Info",
-            )
-
         if candidate_type == "HTTP_ERROR_INFO_EXPOSURE":
             if _is_concrete_error_disclosure(candidate):
                 capped = _cap_ambiguous_confirmed_severity(candidate, current_sev)
@@ -608,6 +601,13 @@ def validate_candidate_after_llm(candidate: Dict[str, Any]) -> Dict[str, Any]:
             return _set_informational(
                 candidate,
                 reason="Error disclosure signal was observed, but concrete internal exposure was not strong enough to confirm.",
+                severity="Info",
+            )
+
+        if is_low_value_disclosure(candidate):
+            return _set_informational(
+                candidate,
+                reason="Low-value or weak disclosure signal downgraded to informational.",
                 severity="Info",
             )
 
