@@ -234,8 +234,17 @@ class ErrorPatternDetector:
         for pattern in self.DB_ERROR_PATTERNS:
             for match in pattern.finditer(body):
                 error = match.group(0).strip()
-                if error and len(error) > 10:
-                    results.append(error[:200])
+                if not error:
+                    continue
+                # Short markers such as ORA-00001 are meaningful only when
+                # carried with nearby SQL/driver context; preserve that
+                # context instead of dropping the match as "too short".
+                start = max(0, match.start() - 120)
+                end = min(len(body), match.end() + 200)
+                context = body[start:end].strip()
+                candidate = context if len(error) <= 10 else error
+                if candidate and len(candidate) > 10:
+                    results.append(candidate[:300])
         return list(dict.fromkeys(results))
     
     def _find_verbose_errors(self, body: str) -> List[str]:
