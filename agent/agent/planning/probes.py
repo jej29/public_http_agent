@@ -2805,7 +2805,7 @@ def build_authenticated_business_probe_plan(
     plan: List[RequestSpec] = []
 
     if max_targets is None:
-        max_targets = int(os.getenv("AUTHENTICATED_BUSINESS_PROBE_MAX_TARGETS", "20"))
+        max_targets = int(os.getenv("AUTHENTICATED_BUSINESS_PROBE_MAX_TARGETS", "30"))
 
     anonymous_norm_paths = set()
     for ep in anonymous_endpoints or []:

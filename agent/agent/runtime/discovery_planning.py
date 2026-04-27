@@ -395,6 +395,10 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
         path = (parts.path or "/").lower()
         query = parts.query or ""
         priority = 0
+        meaningful_html = path.endswith((".html", ".htm")) and any(
+            token in path
+            for token in ("nda", "privacy", "policy", "terms", "notice", "portal", "main", "index")
+        )
 
         if any(token in path for token in (".mvc", ".do", ".action", ".php", "/api/", "/rest/", "/admin")):
             priority += 4
@@ -424,14 +428,16 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
             priority += 4
         if path.endswith((".html", ".htm")):
             priority += 4
-            if any(token in path for token in ("nda", "privacy", "portal", "main", "index")):
-                priority += 3
+            if meaningful_html:
+                priority += 6
+            if "/common/" in path:
+                priority += 2
         if path.endswith((".js", ".mjs")):
-            priority += 5
+            priority += 2
             if any(token in path for token in ("/static/js/", "/assets/", "/js/", "chunk", "vendor", "app.", "main.")):
-                priority += 5
+                priority += 2
             if any(token in path for token in ("chunk-vendors", "/app.js", "/main.js", "/runtime.js", "/vendors", "vendor", "app.", "main.")):
-                priority += 8
+                priority += 2
         if any(token in path for token in ("/admin/admission", "/admin/acadmgmt", "/admin/")):
             priority += 8
         if path.endswith((".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2")):
@@ -453,7 +459,12 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
         static_js_like = path.endswith((".js", ".mjs"))
         app_html_like = path.endswith((".html", ".htm"))
 
-        allow_per_bucket = 2 if (has_query or dynamic_like or static_js_like or app_html_like) else 1
+        if has_query or dynamic_like:
+            allow_per_bucket = 4
+        elif static_js_like or app_html_like:
+            allow_per_bucket = 3
+        else:
+            allow_per_bucket = 2
         if count >= allow_per_bucket:
             continue
 

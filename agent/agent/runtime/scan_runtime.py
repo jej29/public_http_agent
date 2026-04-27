@@ -861,6 +861,10 @@ def _build_static_plan_from_endpoints(
             token in path
             for token in ("/admin/admission", "/admin/acadmgmt", "/admin/", "/api/", "/rest/", "/common", ".do", ".action", ".jsp")
         )
+        meaningful_html_page = path.endswith((".html", ".htm")) and any(
+            token in path
+            for token in ("nda", "privacy", "policy", "terms", "notice", "portal", "main", "index", "/common/")
+        )
         priority_bundle = kind == "asset_js" and any(
             token in path
             for token in ("chunk-vendors", "/app.js", "/main.js", "/runtime.js", "/vendors", "vendor", "app.", "main.")
@@ -870,6 +874,7 @@ def _build_static_plan_from_endpoints(
 
         return (
             not high_value_route,
+            not meaningful_html_page,
             not priority_bundle,
             not auth_only,
             -score,
@@ -2781,7 +2786,7 @@ async def run_scan(
         follow_redirects=follow_redirects,
     ) as client:
         crawl_depth = int(os.getenv("CRAWL_DEPTH", "2"))
-        crawl_max_pages = int(os.getenv("CRAWL_MAX_PAGES", "20"))
+        crawl_max_pages = int(os.getenv("CRAWL_MAX_PAGES", "40"))
         crawl_enable_js = os.getenv("CRAWL_INCLUDE_JS_PATHS", "on").lower() == "on"
 
         manual_auth_meta = apply_manual_auth_to_client(
@@ -2818,9 +2823,9 @@ async def run_scan(
                     "llm_probe_planner_mode": os.getenv("LLM_PROBE_PLANNER_MODE", "off"),
                     "llm_report_mode": os.getenv("LLM_REPORT_MODE", "off"),
                     "crawl_include_js_paths": os.getenv("CRAWL_INCLUDE_JS_PATHS", "on"),
-                    "max_endpoints": os.getenv("MAX_ENDPOINTS", "200"),
+                    "max_endpoints": os.getenv("MAX_ENDPOINTS", "400"),
                     "authenticated_business_probe_max_targets": os.getenv(
-                        "AUTHENTICATED_BUSINESS_PROBE_MAX_TARGETS", "20"
+                        "AUTHENTICATED_BUSINESS_PROBE_MAX_TARGETS", "30"
                     ),
                     "authenticated_business_probe_max_per_category": os.getenv(
                         "AUTHENTICATED_BUSINESS_PROBE_MAX_PER_CATEGORY", ""
@@ -3102,7 +3107,7 @@ async def run_scan(
         elif authenticated and http_only_mode:
             log("AUTH", "Authenticated business probes skipped: HTTP_ONLY_MODE=true")
 
-        max_endpoints = int(os.getenv("MAX_ENDPOINTS", "200"))
+        max_endpoints = int(os.getenv("MAX_ENDPOINTS", "400"))
 
         (
             discovered_endpoints,
