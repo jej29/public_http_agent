@@ -969,7 +969,6 @@ def _risky_method_specs(target_url: str, headers: Dict[str, str]) -> List[Reques
             "/acadmgmt",
             "/api/",
             "/rest/",
-            "/common",
             ".do",
             ".action",
             ".jsp",
@@ -1024,7 +1023,6 @@ def _is_high_value_authenticated_method_target(url: str) -> bool:
             "/acadmgmt",
             "/api/",
             "/rest/",
-            "/common",
             ".do",
             ".action",
             ".jsp",
@@ -1081,7 +1079,7 @@ def build_authenticated_high_value_method_probe_plan(
             score += 30
         elif "/admin/" in path:
             score += 20
-        elif any(tok in path for tok in ("/api/", "/rest/", "/common")):
+        elif any(tok in path for tok in ("/api/", "/rest/")):
             score += 10
         ranked.append((score, url))
 
@@ -3155,7 +3153,6 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
             ".do",
             ".action",
             ".jsp",
-            "/common",   # NDA 같은 enterprise portal root도 민감 대상으로 본다
         )
     )
 
@@ -3192,7 +3189,7 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
     elif intensity == "light":
         high_value_method_target = any(
             tok in target_path_l
-            for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", "/common", ".do", ".action", ".jsp")
+            for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", ".do", ".action", ".jsp")
         )
         category_limits = {
             "baseline": 4,
@@ -3211,7 +3208,7 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
     elif intensity == "medium":
         high_value_method_target = any(
             tok in target_path_l
-            for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", "/common", ".do", ".action", ".jsp")
+            for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", ".do", ".action", ".jsp")
         )
         category_limits = {
             "baseline": 4,
@@ -3230,7 +3227,7 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
     else:
         high_value_method_target = any(
             tok in target_path_l
-            for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", "/common", ".do", ".action", ".jsp")
+            for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", ".do", ".action", ".jsp")
         )
         category_limits = {
             "baseline": 4,
@@ -3260,7 +3257,7 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
 
     high_value_method_target = any(
         tok in target_path_l
-        for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", "/common", ".do", ".action", ".jsp")
+        for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", ".do", ".action", ".jsp")
     )
 
     if high_value_method_target:

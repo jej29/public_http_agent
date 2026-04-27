@@ -859,7 +859,7 @@ def _build_static_plan_from_endpoints(
 
         high_value_route = any(
             token in path
-            for token in ("/admin/admission", "/admin/acadmgmt", "/admin/", "/api/", "/rest/", "/common", ".do", ".action", ".jsp")
+            for token in ("/admin/admission", "/admin/acadmgmt", "/admin/", "/api/", "/rest/", ".do", ".action", ".jsp")
         )
         meaningful_html_page = path.endswith((".html", ".htm")) and any(
             token in path
