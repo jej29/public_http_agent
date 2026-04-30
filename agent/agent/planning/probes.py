@@ -8,6 +8,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit, urlencode
 from agent.core.scope import normalize_url_for_dedup
 from agent.core.common import log
+from agent.runtime.scan_profile import (
+    is_html_breadth_profile,
+    is_method_heavy_target,
+    is_spa_method_profile,
+    resolve_scan_profile,
+)
 from agent.runtime.manual_auth import split_manual_auth_header_chunks
 
 def rand_suffix(n: int = 8) -> str:
@@ -3130,7 +3136,11 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
     seen = set()
 
     is_static_mode = intensity == "static"
+    profile = resolve_scan_profile()
     target_path_l = urlsplit(with_slash).path.lower()
+    method_heavy_target = is_method_heavy_target(target_path_l, profile)
+    html_breadth_profile = is_html_breadth_profile(profile)
+    spa_method_profile = is_spa_method_profile(profile)
 
     legacy_business_target = any(tok in target_path_l for tok in (".do", ".action", ".jsp"))
 
@@ -3173,18 +3183,18 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
 
     elif legacy_business_target:
         category_limits = {
-            "baseline": 3,
+            "baseline": 4 if html_breadth_profile else 3,
             "notfound": 0,
-            "resources": 2,
+            "resources": 3 if html_breadth_profile else 2,
             "directory": 0,
-            "methods": 0,
+            "methods": 0 if html_breadth_profile else (2 if method_heavy_target else 0),
             "cors": 0,
             "headers": 0,
             "path": 2,   # 기존 0 -> 2
             "query": 2,  # 기존 0 -> 2
             "body": 0,
         }
-        total_budget = int(os.getenv("LEGACY_DO_REQUEST_BUDGET", "10"))
+        total_budget = int(os.getenv("LEGACY_DO_REQUEST_BUDGET", "12" if html_breadth_profile else "10"))
 
     elif intensity == "light":
         high_value_method_target = any(
@@ -3243,6 +3253,66 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
         }
         total_budget = int(os.getenv("FULL_REQUEST_BUDGET", "36"))
 
+    if html_breadth_profile and not is_static_mode:
+        if legacy_business_target:
+            category_limits.update({
+                "baseline": 4,
+                "resources": 3,
+                "methods": 0,
+                "path": 1,
+                "query": 1,
+            })
+            total_budget = int(os.getenv("LEGACY_DO_REQUEST_BUDGET", str(max(total_budget, 12))))
+        elif intensity == "light":
+            category_limits.update({
+                "baseline": 5,
+                "resources": 3,
+                "directory": 2,
+                "methods": 1 if method_heavy_target else 0,
+                "headers": 2,
+                "path": 1,
+                "query": 1,
+            })
+            total_budget = int(os.getenv("LIGHT_REQUEST_BUDGET", str(max(total_budget, 14))))
+        elif intensity == "medium":
+            category_limits.update({
+                "baseline": 5,
+                "resources": 4,
+                "directory": 3,
+                "methods": 1 if method_heavy_target else 0,
+                "headers": 2,
+                "path": 1,
+                "query": 1,
+            })
+            total_budget = int(os.getenv("MEDIUM_REQUEST_BUDGET", str(max(total_budget, 26))))
+        else:
+            category_limits.update({
+                "baseline": 5,
+                "resources": 5,
+                "directory": 4,
+                "methods": 2 if method_heavy_target else 0,
+                "headers": 2,
+                "path": 2,
+                "query": 2,
+            })
+            total_budget = int(os.getenv("FULL_REQUEST_BUDGET", str(max(total_budget, 40))))
+    elif spa_method_profile and not is_static_mode and not legacy_business_target:
+        if intensity == "light":
+            category_limits.update({
+                "resources": 5,
+                "methods": 4 if method_heavy_target else category_limits["methods"],
+            })
+        elif intensity == "medium":
+            category_limits.update({
+                "resources": 7,
+                "methods": 4 if method_heavy_target else category_limits["methods"],
+            })
+        else:
+            category_limits.update({
+                "resources": 9,
+                "methods": 5 if method_heavy_target else category_limits["methods"],
+            })
+
     def add_limited(specs: List[RequestSpec], limit: int) -> None:
         if limit <= 0:
             return
@@ -3255,12 +3325,7 @@ def build_probe_plan(target: str, intensity: str = "full") -> List[RequestSpec]:
             if count >= limit or len(plan) >= total_budget:
                 break
 
-    high_value_method_target = any(
-        tok in target_path_l
-        for tok in ("/admin", "/admission", "/acadmgmt", "/api/", "/rest/", ".do", ".action", ".jsp")
-    )
-
-    if high_value_method_target:
+    if method_heavy_target:
         add_limited(_risky_method_specs(with_slash, headers), category_limits["methods"])
         add_limited(_baseline_specs(with_slash, headers), category_limits["baseline"])
         add_limited(_notfound_specs(base, headers), category_limits["notfound"])

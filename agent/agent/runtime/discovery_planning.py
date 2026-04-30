@@ -8,6 +8,13 @@ from urllib.parse import urlsplit
 
 from agent.core.common import log
 from agent.planning.probes import RequestSpec
+from agent.runtime.scan_profile import (
+    endpoint_bucket_limit,
+    is_html_breadth_profile,
+    is_meaningful_html_path,
+    is_spa_high_value_path,
+    resolve_scan_profile,
+)
 
 
 LOW_VALUE_FILE_HINTS = (
@@ -111,6 +118,7 @@ def choose_probe_intensity_for_rank(rank: int) -> str:
 
 
 def choose_probe_intensity_for_endpoint(rank: int, ep: Dict[str, Any]) -> str:
+    profile = resolve_scan_profile()
     kind = endpoint_kind(ep)
     score = int(ep.get("score", 0) or 0)
     url = endpoint_url(ep).lower()
@@ -126,9 +134,15 @@ def choose_probe_intensity_for_endpoint(rank: int, ep: Dict[str, Any]) -> str:
     if path in {"", "/"}:
         return "medium"
     if kind == "asset_js":
+        if is_html_breadth_profile(profile):
+            return "light"
         if any(token in path for token in ("chunk-vendors", "/app.js", "/main.js", "/runtime.js", "/vendors", "vendor", "app.", "main.")):
             return "medium"
         return "light"
+    if is_html_breadth_profile(profile) and is_meaningful_html_path(path):
+        return "full" if auth_only or has_query else "medium"
+    if is_spa_high_value_path(path):
+        return "full" if auth_only or has_query else "medium"
 
     high_signal_tokens = (
         "phpinfo",
@@ -147,7 +161,7 @@ def choose_probe_intensity_for_endpoint(rank: int, ep: Dict[str, Any]) -> str:
         return "medium"
 
     if auth_only and has_query and any(token in path for token in (".do", ".action", ".php", "/api/", "/rest/")):
-        return "medium"
+        return "full" if is_spa_high_value_path(path) else "medium"
 
     if any(token in url for token in ("/login", "/signin", "/logout")):
         return "light"
@@ -381,6 +395,7 @@ def _endpoint_bucket(url: str) -> str:
 
 
 def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List[str]:
+    profile = resolve_scan_profile()
     unique_urls: List[str] = []
     seen_exact = set()
     for url in urls:
@@ -395,10 +410,8 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
         path = (parts.path or "/").lower()
         query = parts.query or ""
         priority = 0
-        meaningful_html = path.endswith((".html", ".htm")) and any(
-            token in path
-            for token in ("nda", "privacy", "policy", "terms", "notice", "portal", "main", "index")
-        )
+        meaningful_html = is_meaningful_html_path(path)
+        spa_high_value = is_spa_high_value_path(path)
 
         if any(token in path for token in (".mvc", ".do", ".action", ".php", "/api/", "/rest/", "/admin")):
             priority += 4
@@ -438,8 +451,15 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
                 priority += 2
             if any(token in path for token in ("chunk-vendors", "/app.js", "/main.js", "/runtime.js", "/vendors", "vendor", "app.", "main.")):
                 priority += 2
-        if any(token in path for token in ("/admin/admission", "/admin/acadmgmt", "/admin/")):
+        if spa_high_value:
             priority += 8
+        if is_html_breadth_profile(profile):
+            if meaningful_html:
+                priority += 8
+            if path.endswith((".html", ".htm", ".do", ".action")):
+                priority += 2
+            if path.endswith((".js", ".mjs")):
+                priority -= 2
         if path.endswith((".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2")):
             priority -= 3
 
@@ -458,13 +478,14 @@ def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List
         dynamic_like = any(token in path for token in (".do", ".action", ".php", "/api/", "/rest/"))
         static_js_like = path.endswith((".js", ".mjs"))
         app_html_like = path.endswith((".html", ".htm"))
-
-        if has_query or dynamic_like:
-            allow_per_bucket = 4
-        elif static_js_like or app_html_like:
-            allow_per_bucket = 3
-        else:
-            allow_per_bucket = 2
+        allow_per_bucket = endpoint_bucket_limit(
+            path=path,
+            has_query=has_query,
+            dynamic_like=dynamic_like,
+            static_js_like=static_js_like,
+            app_html_like=app_html_like,
+            profile=profile,
+        )
         if count >= allow_per_bucket:
             continue
 

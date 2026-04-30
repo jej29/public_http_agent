@@ -47,6 +47,13 @@ from agent.runtime.scan_summary import (
     finalize_coverage_assessment,
     finding_group,
 )
+from agent.runtime.scan_profile import (
+    is_html_breadth_profile,
+    is_meaningful_html_path,
+    is_spa_high_value_path,
+    is_spa_method_profile,
+    resolve_scan_profile as runtime_resolve_scan_profile,
+)
 from agent.runtime.discovery_planning import (
     choose_probe_intensity_for_endpoint,
     derive_allowed_app_prefixes,
@@ -847,8 +854,10 @@ def _build_static_plan_from_endpoints(
 ) -> List[RequestSpec]:
     static_plan: List[RequestSpec] = []
     seen_plan_keys = set()
+    profile = runtime_resolve_scan_profile()
 
-    js_bundle_budget = int(os.getenv("CLIENT_BUNDLE_PROBE_MAX_TARGETS", "12"))
+    default_js_budget = "8" if is_html_breadth_profile(profile) else ("16" if is_spa_method_profile(profile) else "12")
+    js_bundle_budget = int(os.getenv("CLIENT_BUNDLE_PROBE_MAX_TARGETS", default_js_budget))
     js_bundle_count = 0
 
     def _static_endpoint_priority(ep: Dict[str, Any]) -> tuple:
@@ -857,21 +866,37 @@ def _build_static_plan_from_endpoints(
         kind = endpoint_kind(ep)
         score = int(ep.get("score", 0) or 0) if isinstance(ep, dict) else 0
 
-        high_value_route = any(
-            token in path
-            for token in ("/admin/admission", "/admin/acadmgmt", "/admin/", "/api/", "/rest/", ".do", ".action", ".jsp")
-        )
-        meaningful_html_page = path.endswith((".html", ".htm")) and any(
-            token in path
-            for token in ("nda", "privacy", "policy", "terms", "notice", "portal", "main", "index", "/common/")
-        )
+        high_value_route = is_spa_high_value_path(path) or any(token in path for token in (".do", ".action"))
+        meaningful_html_page = is_meaningful_html_path(path)
         priority_bundle = kind == "asset_js" and any(
             token in path
             for token in ("chunk-vendors", "/app.js", "/main.js", "/runtime.js", "/vendors", "vendor", "app.", "main.")
         )
         auth_only = is_authenticated_only_endpoint(ep)
         depth = int(ep.get("depth", 9999) or 9999) if isinstance(ep, dict) else 9999
+        html_breadth = is_html_breadth_profile(profile)
+        spa_method = is_spa_method_profile(profile)
 
+        if html_breadth:
+            return (
+                not meaningful_html_page,
+                not auth_only,
+                not high_value_route,
+                priority_bundle,
+                -score,
+                depth,
+                ep_url,
+            )
+        if spa_method:
+            return (
+                not high_value_route,
+                not priority_bundle,
+                not auth_only,
+                not meaningful_html_page,
+                -score,
+                depth,
+                ep_url,
+            )
         return (
             not high_value_route,
             not meaningful_html_page,
@@ -2468,7 +2493,7 @@ def _log_object_replay_plan(
         )
 
 def resolve_scan_profile() -> str:
-    return (os.getenv("SCAN_PROFILE") or "balanced").strip().lower()
+    return runtime_resolve_scan_profile()
 
 
 def resolve_scan_settings() -> Dict[str, Any]:
@@ -2477,6 +2502,8 @@ def resolve_scan_settings() -> Dict[str, Any]:
     defaults = {
         "fast": {"timeout_seconds": 4.0, "retries": 0, "concurrency": 8, "follow_redirects": False},
         "balanced": {"timeout_seconds": 6.0, "retries": 1, "concurrency": 6, "follow_redirects": False},
+        "server_html_broad": {"timeout_seconds": 7.0, "retries": 1, "concurrency": 6, "follow_redirects": False},
+        "spa_auth_heavy": {"timeout_seconds": 8.0, "retries": 1, "concurrency": 6, "follow_redirects": False},
         "thorough": {"timeout_seconds": 10.0, "retries": 1, "concurrency": 5, "follow_redirects": False},
     }.get(profile, {
         "timeout_seconds": 6.0,

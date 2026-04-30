@@ -28,6 +28,7 @@ from agent.http.http_session import (
     snapshot_cookie_jar,
 )
 from agent.method_capability import verify_risky_http_methods_capability
+from agent.runtime.scan_profile import resolve_scan_profile as runtime_resolve_scan_profile
 from agent.core.severity import apply_base_severity_to_candidates, apply_combination_severity
 from agent.analysis.validation_policy import validate_candidate_after_llm
 from agent.analysis.verification_policy import (
@@ -68,7 +69,7 @@ FILEISH_PARAM_NAMES = {
 }
 
 def scan_profile() -> str:
-    return (os.getenv("SCAN_PROFILE") or "balanced").strip().lower()
+    return runtime_resolve_scan_profile()
 
 
 def looks_like_static_asset_url(url: str) -> bool:
