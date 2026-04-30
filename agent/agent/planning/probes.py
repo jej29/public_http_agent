@@ -1055,6 +1055,19 @@ def build_authenticated_high_value_method_probe_plan(
         if isinstance(ep, dict) and str(ep.get("url") or "").strip()
     }
 
+    def _fallback_high_value_parent_urls(url: str) -> List[str]:
+        parts = urlsplit(str(url or "").strip())
+        path = (parts.path or "/").lower()
+        root = f"{parts.scheme}://{parts.netloc}"
+        out: List[str] = []
+
+        if "/admin/acadmgmt/" in path:
+            out.append(f"{root}/admin/acadmgmt")
+        if "/admin/admission/" in path:
+            out.append(f"{root}/admin/admission")
+
+        return out
+
     ranked: List[tuple[int, str]] = []
     seen_urls = set()
     for ep in authenticated_endpoints or []:
@@ -1088,6 +1101,20 @@ def build_authenticated_high_value_method_probe_plan(
         elif any(tok in path for tok in ("/api/", "/rest/")):
             score += 10
         ranked.append((score, url))
+
+        for fallback_url in _fallback_high_value_parent_urls(url):
+            if fallback_url in seen_urls:
+                continue
+            seen_urls.add(fallback_url)
+            fallback_path = (urlsplit(fallback_url).path or "/").lower()
+            fallback_score = score + 25
+            if "/admin/acadmgmt" in fallback_path:
+                fallback_score += 30
+            elif "/admin/admission" in fallback_path:
+                fallback_score += 25
+            if _normalize_replay_key(fallback_url) not in anonymous_norm_paths:
+                fallback_score += 10
+            ranked.append((fallback_score, fallback_url))
 
     ranked.sort(key=lambda item: (-item[0], len(urlsplit(item[1]).path or "/"), item[1]))
 

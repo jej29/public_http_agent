@@ -658,6 +658,17 @@ def _build_static_client_bundle_disclosure_signals(
     debug_tokens = markers.get("debug_or_config_tokens") or []
     snippets = markers.get("bundle_evidence_snippets") or []
     runtime_config_snippets = markers.get("runtime_config_snippets") or []
+    has_runtime_config = bool(runtime_config_snippets)
+    has_interesting_urls = bool(urls)
+    has_debug_config = len(debug_tokens) >= 2 or any(
+        token in debug_tokens
+        for token in ("productgroupid", "productid", "productphase", "rumservertype", "applicationservers", "loglevel")
+    )
+
+    # Source-map/sourceURL markers by themselves are noisy for modern frontend bundles.
+    # Keep the finding only when the bundle also exposes meaningful config/URL context.
+    if source_markers and not (has_runtime_config or has_interesting_urls or has_debug_config):
+        return []
 
     exposed_information: List[str] = []
     if source_markers:
@@ -681,7 +692,7 @@ def _build_static_client_bundle_disclosure_signals(
     if not exposed_information:
         return []
 
-    has_runtime_config = bool(urls or debug_tokens)
+    has_runtime_config = bool(urls or debug_tokens or runtime_config_snippets)
     signal = _build_signal(
         signal_type="client_bundle_disclosure",
         finding_type="HTTP_SYSTEM_INFO_EXPOSURE",

@@ -12,6 +12,7 @@ from agent.runtime.scan_profile import (
     endpoint_bucket_limit,
     is_html_breadth_profile,
     is_meaningful_html_path,
+    is_spa_method_profile,
     is_spa_high_value_path,
     resolve_scan_profile,
 )
@@ -260,6 +261,16 @@ def _url_in_allowed_app_scope(url: str, allowed_prefixes: List[str], base_target
     if not path:
         path = "/"
 
+    # SPA targets often serve the authenticated shell under /admin or /common
+    # while loading same-origin bundles from root-level asset prefixes such as
+    # /static/js/app.js. Keep those JS bundle assets in scope so downstream
+    # client-bundle disclosure checks are not pruned away.
+    lower_path = path.lower()
+    if lower_path.endswith((".js", ".mjs")) and lower_path.startswith(
+        ("/static/", "/assets/", "/js/")
+    ):
+        return True
+
     normalized_prefixes: List[str] = []
     for prefix in allowed_prefixes or []:
         value = re.sub(r"/+", "/", str(prefix or "")).rstrip("/")
@@ -394,6 +405,44 @@ def _endpoint_bucket(url: str) -> str:
     return f"{parts.scheme}://{parts.netloc}{norm}"
 
 
+def _priority_static_bundle_urls(
+    endpoint_map: Dict[str, Dict[str, Any]],
+    *,
+    profile: str,
+) -> List[str]:
+    candidates: List[tuple[int, int, int, str]] = []
+    max_keep = int(
+        os.getenv(
+            "PRIORITY_JS_ENDPOINTS",
+            "8" if is_spa_method_profile(profile) else ("2" if is_html_breadth_profile(profile) else "4"),
+        )
+    )
+    if max_keep <= 0:
+        return []
+
+    for url, endpoint in (endpoint_map or {}).items():
+        if endpoint_kind(endpoint) != "asset_js":
+            continue
+
+        path = (urlsplit(url).path or "/").lower()
+        score = int(endpoint.get("score", 0) or 0) if isinstance(endpoint, dict) else 0
+        depth = int(endpoint.get("depth", 9999) or 9999) if isinstance(endpoint, dict) else 9999
+        priority = 0
+
+        if any(token in path for token in ("chunk-vendors", "/app.js", "/main.js", "/runtime.js", "/vendors", "vendor", "app.", "main.")):
+            priority += 10
+        if any(token in path for token in ("/static/js/", "/assets/", "/js/", "chunk")):
+            priority += 6
+        if is_spa_high_value_path(path):
+            priority += 4
+
+        if priority <= 0:
+            continue
+        candidates.append((-priority, -score, depth, url))
+
+    return [url for _, _, _, url in sorted(candidates)[:max_keep]]
+
+
 def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List[str]:
     profile = resolve_scan_profile()
     unique_urls: List[str] = []
@@ -521,6 +570,7 @@ def prepare_discovered_endpoints(
     max_endpoints: int,
     seed_urls: List[str] | None = None,
 ) -> tuple[List[Dict[str, Any]], int, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    profile = resolve_scan_profile()
     filtered_anonymous_endpoints = filter_endpoints_by_app_scope(
         anonymous_endpoints,
         base_target=target,
@@ -598,16 +648,25 @@ def prepare_discovered_endpoints(
             },
         )
 
+    preferred_static_bundle_urls = _priority_static_bundle_urls(
+        discovered_endpoint_map,
+        profile=profile,
+    )
+
     pruned_urls = prune_discovered_endpoints(
         list(discovered_endpoint_map.keys()),
         max_endpoints=max_endpoints,
     )
+    for bundle_url in reversed(preferred_static_bundle_urls):
+        if bundle_url in pruned_urls:
+            continue
+        pruned_urls.insert(0, bundle_url)
     for seed in reversed(explicit_seed_urls):
         if seed in pruned_urls:
             continue
         pruned_urls.insert(0, seed)
     if len(pruned_urls) > max_endpoints:
-        keep = set(explicit_seed_urls)
+        keep = set(explicit_seed_urls) | set(preferred_static_bundle_urls)
         trimmed: List[str] = []
         for url in pruned_urls:
             if len(trimmed) >= max_endpoints:
@@ -618,7 +677,7 @@ def prepare_discovered_endpoints(
     if target not in pruned_urls:
         pruned_urls = [target] + pruned_urls
     if len(pruned_urls) > max_endpoints:
-        must_keep = {target, *explicit_seed_urls}
+        must_keep = {target, *explicit_seed_urls, *preferred_static_bundle_urls}
         trimmed: List[str] = []
         for url in pruned_urls:
             if url in trimmed:
