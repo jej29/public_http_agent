@@ -27,6 +27,112 @@ _DIFF_ROUTE_SKIP_PATTERNS = (
     "/logout",
 )
 
+_SENSITIVE_USER_FIELD_PATTERNS = [
+    re.compile(
+        r'(?i)(?P<key>email|e-mail|mail|phone|mobile|tel|login[_\s-]?ip|last[_\s-]?login(?:date|time)?|recent[_\s-]?login|employee(?:[_\s-]?(?:id|no|number))|emp(?:[_\s-]?(?:id|no|number))|department|dept|role|position|title|enc[_\s-]?pw|password[_\s-]?hash|passwd[_\s-]?hash|pwd[_\s-]?hash)\s*["\']?\s*[:=]\s*["\']?(?P<value>[^"<>\r\n,}{]{3,160})'
+    ),
+    re.compile(
+        r'(?P<key>이메일|휴대폰|핸드폰|전화번호|로그인\s*IP|최근\s*로그인(?:\s*일시)?|사번|부서|권한|직급|암호화된\s*비밀번호)\s*[:：]\s*(?P<value>[^\r\n<]{2,160})'
+    ),
+]
+
+_SENSITIVE_USER_VALUE_HINTS = {
+    "email": re.compile(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b"),
+    "phone": re.compile(r"\b(?:\+?\d{1,3}[- ]?)?(?:01[0-9]|0\d{1,2})[- ]?\d{3,4}[- ]?\d{4}\b"),
+    "login_ip": re.compile(r"\b(?:10|127|192\.168|172\.(?:1[6-9]|2\d|3[0-1]))(?:\.\d{1,3}){3}\b"),
+    "employee": re.compile(r"\b[A-Za-z0-9_-]{4,24}\b"),
+}
+
+
+def _normalize_sensitive_user_key(raw_key: str) -> str:
+    key = str(raw_key or "").strip().lower()
+    key = key.replace("-", "").replace("_", "").replace(" ", "")
+    mapping = {
+        "email": "email",
+        "e-mail": "email",
+        "mail": "email",
+        "phone": "phone",
+        "mobile": "phone",
+        "tel": "phone",
+        "로그인ip": "login_ip",
+        "loginip": "login_ip",
+        "최근로그인": "last_login",
+        "최근로그인일시": "last_login",
+        "lastlogin": "last_login",
+        "lastlogindate": "last_login",
+        "lastlogintime": "last_login",
+        "recentlogin": "last_login",
+        "employeeid": "employee_id",
+        "employeeno": "employee_id",
+        "employeenumber": "employee_id",
+        "empid": "employee_id",
+        "empno": "employee_id",
+        "empnumber": "employee_id",
+        "사번": "employee_id",
+        "department": "department",
+        "dept": "department",
+        "부서": "department",
+        "role": "role",
+        "권한": "role",
+        "position": "position",
+        "title": "position",
+        "직급": "position",
+        "encpw": "credential_metadata",
+        "암호화된비밀번호": "credential_metadata",
+        "passwordhash": "credential_metadata",
+        "passwdhash": "credential_metadata",
+        "pwdhash": "credential_metadata",
+    }
+    return mapping.get(key, key or "profile")
+
+
+def _extract_sensitive_user_field_values(body: str) -> List[str]:
+    text = str(body or "")
+    if not text.strip():
+        return []
+
+    values: List[str] = []
+    for pattern in _SENSITIVE_USER_FIELD_PATTERNS:
+        for match in pattern.finditer(text):
+            key = _normalize_sensitive_user_key(match.group("key"))
+            value = " ".join(str(match.group("value") or "").split()).strip(" ,;:")
+            if not value:
+                continue
+            if len(value) < 2 or len(value) > 160:
+                continue
+            value_l = value.lower()
+            if value_l in {"null", "none", "undefined", "n/a", "-"}:
+                continue
+            if key == "email" and not _SENSITIVE_USER_VALUE_HINTS["email"].search(value):
+                continue
+            if key == "phone" and not _SENSITIVE_USER_VALUE_HINTS["phone"].search(value):
+                continue
+            if key == "login_ip" and not _SENSITIVE_USER_VALUE_HINTS["login_ip"].search(value):
+                continue
+            if key == "employee_id" and not _SENSITIVE_USER_VALUE_HINTS["employee"].search(value):
+                continue
+            label = {
+                "email": "Email",
+                "phone": "Phone",
+                "login_ip": "Login IP",
+                "last_login": "Last login",
+                "employee_id": "Employee ID",
+                "department": "Department",
+                "role": "Role",
+                "position": "Position",
+                "credential_metadata": "Credential metadata",
+            }.get(key, "Profile field")
+            values.append(f"{label}: {value}")
+
+    seen = set()
+    out: List[str] = []
+    for item in values:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out[:12]
+
 
 def _entry_route_key(item: Dict[str, Any]) -> str:
     final_url = str(item.get("final_url") or item.get("url") or "").strip()
@@ -91,6 +197,8 @@ def _extract_differential_exposure_values(body: str) -> List[str]:
     internal_ips = _filter_meaningful_internal_ips(_find_matches(INTERNAL_IP_PATTERNS, text, 10))
     for ip in internal_ips:
         values.append(f"Internal IP: {ip}")
+
+    values.extend(_extract_sensitive_user_field_values(text))
 
     seen = set()
     out: List[str] = []
@@ -238,12 +346,31 @@ def _differential_subtype(exposed_information: List[str], auth_body: str) -> str
         return "authenticated_phpinfo_disclosure"
     if any("=" in item and any(tok in item.lower() for tok in ("db_", "password", "secret", "token")) for item in exposed_information):
         return "authenticated_config_disclosure"
+    if any(item.startswith("Credential metadata:") for item in exposed_information):
+        return "authenticated_credential_metadata_disclosure"
+    if any(
+        item.startswith(prefix)
+        for item in exposed_information
+        for prefix in ("Email:", "Phone:", "Login IP:", "Last login:", "Employee ID:", "Department:", "Role:", "Position:")
+    ):
+        return "authenticated_profile_disclosure"
     return "authenticated_diagnostic_disclosure"
 
 
 def _differential_severity(exposed_information: List[str], subtype: str) -> str:
-    if subtype in {"authenticated_phpinfo_disclosure", "authenticated_config_disclosure"}:
+    if subtype in {
+        "authenticated_phpinfo_disclosure",
+        "authenticated_config_disclosure",
+        "authenticated_credential_metadata_disclosure",
+    }:
         return "Medium"
+    if subtype == "authenticated_profile_disclosure":
+        high_value_count = sum(
+            1
+            for item in exposed_information
+            if item.startswith(("Email:", "Phone:", "Login IP:", "Employee ID:"))
+        )
+        return "Medium" if high_value_count >= 2 else "Low"
     if any(item.lower().startswith("runtime error:") for item in exposed_information):
         return "Medium"
     return "Low"
@@ -252,6 +379,8 @@ def _differential_severity(exposed_information: List[str], subtype: str) -> str:
 def _differential_cwe(subtype: str) -> str:
     if subtype == "authenticated_config_disclosure":
         return "CWE-538"
+    if subtype in {"authenticated_profile_disclosure", "authenticated_credential_metadata_disclosure"}:
+        return "CWE-200"
     return "CWE-497"
 
 
