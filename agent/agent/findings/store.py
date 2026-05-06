@@ -145,6 +145,7 @@ def _classification_rank(finding: Dict[str, Any]) -> tuple[int, ...]:
     mapping_status = str(finding.get("cwe_mapping_status") or "")
     confidence = float(finding.get("confidence") or 0.0)
     subtype = str(finding.get("subtype") or "")
+    family = str(finding.get("family") or "")
     evidence = finding.get("evidence") or {}
 
     type_priority = {
@@ -179,8 +180,22 @@ def _classification_rank(finding: Dict[str, Any]) -> tuple[int, ...]:
         if evidence.get("set_cookie_observed") or subtype in {"httponly_missing", "secure_missing", "samesite_missing"}:
             cookie_direct_evidence_bonus = 1
 
+    system_info_body_bonus = 0
+    internal_ip_bonus = 0
+    direct_200_bonus = 0
+    if candidate_type == "HTTP_SYSTEM_INFO_EXPOSURE":
+        if family == "HTTP_BODY_DISCLOSURE":
+            system_info_body_bonus = 1
+        if subtype == "detector_internal_ip" or evidence.get("internal_ips"):
+            internal_ip_bonus = 1
+        if (finding.get("status_code") or evidence.get("status_code")) == 200:
+            direct_200_bonus = 1
+
     return (
         type_priority.get(candidate_type, 0),
+        internal_ip_bonus,
+        system_info_body_bonus,
+        direct_200_bonus,
         cookie_direct_evidence_bonus,
         1 if cwe else 0,
         1 if not mapping_status else 0,
