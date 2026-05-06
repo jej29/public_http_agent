@@ -482,6 +482,143 @@ def _priority_meaningful_html_urls(
     return [url for _, _, _, url in candidates[:max_keep]]
 
 
+def _semantic_html_seed_urls(
+    *,
+    endpoint_map: Dict[str, Dict[str, Any]],
+    target: str,
+    allowed_prefixes: List[str],
+    profile: str,
+) -> List[str]:
+    if not is_html_breadth_profile(profile):
+        return []
+
+    parts = urlsplit(target)
+    root = f"{parts.scheme}://{parts.netloc}"
+    out: List[str] = []
+    seen = set()
+    meaningful_tokens = {
+        "index",
+        "main",
+        "home",
+        "portal",
+        "privacy",
+        "policy",
+        "terms",
+        "notice",
+        "member",
+        "profile",
+        "about",
+        "help",
+        "guide",
+        "intro",
+        "agreement",
+        "contract",
+        "nda",
+    }
+
+    def _add(path: str, *, score: int = 0) -> None:
+        normalized_path = re.sub(r"/+", "/", str(path or "/")).strip()
+        if not normalized_path.startswith("/"):
+            normalized_path = "/" + normalized_path
+        url = f"{root}{normalized_path}"
+        if url in seen:
+            return
+        seen.add(url)
+        out.append(url)
+
+    def _path_tokens(raw_path: str) -> List[str]:
+        path = re.sub(r"/+", "/", str(raw_path or "/"))
+        segments = [segment for segment in path.split("/") if segment]
+        tokens: List[str] = []
+        for segment in segments:
+            base = re.sub(r"\.[A-Za-z0-9]+$", "", segment)
+            for piece in re.split(r"[_\-.]+", base):
+                piece = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", piece)
+                for token in piece.split():
+                    normalized = token.strip().lower()
+                    if normalized:
+                        tokens.append(normalized)
+        return list(dict.fromkeys(tokens))
+
+    def _parent_dirs(raw_path: str) -> List[str]:
+        path = re.sub(r"/+", "/", str(raw_path or "/"))
+        segments = [segment for segment in path.split("/") if segment]
+        dirs: List[str] = ["/"]
+        if not segments:
+            return dirs
+        stop = len(segments)
+        if "." in segments[-1]:
+            stop -= 1
+        prefix_segments: List[str] = []
+        for idx in range(stop):
+            prefix_segments.append(segments[idx])
+            dirs.append("/" + "/".join(prefix_segments))
+        return list(dict.fromkeys(dirs))
+
+    discovered_paths = {
+        re.sub(r"/+", "/", urlsplit(str(url or "")).path or "/")
+        for url in endpoint_map.keys()
+    }
+
+    # Keep the discovered HTML-like routes themselves sticky.
+    for path in discovered_paths:
+        lower_path = path.lower()
+        if is_meaningful_html_path(lower_path):
+            _add(path, score=100)
+
+    # Derive nearby semantic HTML siblings from discovered route names instead
+    # of hardcoding target-specific files.
+    candidate_specs: List[tuple[int, str]] = []
+    for path in discovered_paths:
+        lower_path = path.lower()
+        if lower_path.endswith((".css", ".js", ".mjs", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".mp4", ".pdf", ".zip")):
+            continue
+
+        dirs = _parent_dirs(path)
+        tokens = [token for token in _path_tokens(path) if token in meaningful_tokens]
+        if not tokens:
+            continue
+
+        for directory in dirs:
+            normalized_dir = directory.rstrip("/") or "/"
+            for token in tokens:
+                if token in {"index", "main", "home"}:
+                    candidate_specs.append((80, f"{normalized_dir}/{token}.html" if normalized_dir != "/" else f"/{token}.html"))
+                else:
+                    candidate_specs.append((95 if token in {"privacy", "nda"} else 85, f"{normalized_dir}/{token}.html" if normalized_dir != "/" else f"/{token}.html"))
+
+            if any(token in tokens for token in {"portal", "main", "home"}):
+                candidate_specs.append((78, f"{normalized_dir}/index.html" if normalized_dir != "/" else "/index.html"))
+
+    candidate_specs.sort(key=lambda item: (-item[0], item[1]))
+
+    normalized_prefixes: List[str] = []
+    for prefix in allowed_prefixes or []:
+        value = re.sub(r"/+", "/", str(prefix or "")).rstrip("/")
+        normalized_prefixes.append(value or "/")
+
+    for prefix in normalized_prefixes:
+        if prefix != "/":
+            _add(prefix, score=60)
+
+    max_keep = int(os.getenv("SEMANTIC_HTML_SEED_MAX_TARGETS", "10"))
+    kept = 0
+    for _score, candidate_path in candidate_specs:
+        normalized_candidate_path = re.sub(r"/+", "/", candidate_path)
+        if max_keep > 0 and kept >= max_keep:
+            break
+        if not normalized_candidate_path.startswith("/"):
+            normalized_candidate_path = "/" + normalized_candidate_path
+        candidate_url = f"{root}{normalized_candidate_path}"
+        if not _url_in_allowed_app_scope(candidate_url, allowed_prefixes, target):
+            continue
+        if normalized_candidate_path not in discovered_paths:
+            _add(normalized_candidate_path, score=_score)
+            kept += 1
+
+    return out
+
+
 def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List[str]:
     profile = resolve_scan_profile()
     unique_urls: List[str] = []
@@ -682,6 +819,36 @@ def prepare_discovered_endpoints(
                 "is_redirect_target": False,
                 "is_session_destructive": False,
                 "score": 100,
+                "state": "seeded",
+                "states": ["seeded"],
+            },
+        )
+
+    for generated_seed in _semantic_html_seed_urls(
+        endpoint_map=discovered_endpoint_map,
+        target=target,
+        allowed_prefixes=allowed_app_prefixes,
+        profile=profile,
+    ):
+        if generated_seed in seen_seed_urls:
+            continue
+        seen_seed_urls.add(generated_seed)
+        if not _url_in_allowed_app_scope(generated_seed, allowed_app_prefixes, target):
+            continue
+        explicit_seed_urls.append(generated_seed)
+        discovered_endpoint_map.setdefault(
+            generated_seed,
+            {
+                "url": generated_seed,
+                "kind": "page",
+                "source": "profile_seed",
+                "depth": 0,
+                "method": "GET",
+                "field_names": [],
+                "query_param_names": [],
+                "is_redirect_target": False,
+                "is_session_destructive": False,
+                "score": 95,
                 "state": "seeded",
                 "states": ["seeded"],
             },
