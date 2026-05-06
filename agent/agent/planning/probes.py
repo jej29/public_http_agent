@@ -11,6 +11,7 @@ from agent.core.common import log
 from agent.runtime.scan_profile import (
     is_html_breadth_profile,
     is_method_heavy_target,
+    is_meaningful_html_path,
     is_spa_method_profile,
     resolve_scan_profile,
 )
@@ -1045,9 +1046,13 @@ def build_authenticated_high_value_method_probe_plan(
     headers = _base_headers()
     seen = set()
     plan: List[RequestSpec] = []
+    profile = resolve_scan_profile()
+    html_breadth_profile = is_html_breadth_profile(profile)
+    spa_method_profile = is_spa_method_profile(profile)
 
     if max_targets is None:
-        max_targets = int(os.getenv("AUTHENTICATED_HIGH_VALUE_METHOD_PROBE_MAX_TARGETS", "12"))
+        default_max_targets = "16" if (html_breadth_profile or spa_method_profile) else "12"
+        max_targets = int(os.getenv("AUTHENTICATED_HIGH_VALUE_METHOD_PROBE_MAX_TARGETS", default_max_targets))
 
     anonymous_norm_paths = {
         _normalize_replay_key(str(ep.get("url") or "").strip())
@@ -1068,7 +1073,72 @@ def build_authenticated_high_value_method_probe_plan(
 
         return out
 
-    ranked: List[tuple[int, str]] = []
+    def _auth_method_specs_for_target(url: str, *, force_patch: bool = False) -> List[RequestSpec]:
+        specs = _risky_method_specs(url, headers)
+        if force_patch and not any(spec.method == "PATCH" for spec in specs):
+            patch_spec = RequestSpec(
+                name="method_patch",
+                method="PATCH",
+                url=url,
+                headers=headers,
+                source="authenticated_priority_method_probe",
+                family="method_behavior",
+                mutation_class="safe_extended_method_probe",
+                surface_hint="response.headers",
+                expected_signal="allow_header_or_status_change",
+                comparison_group="method_matrix",
+                auth_state="authenticated",
+            )
+            specs.insert(1, patch_spec)
+        return specs
+
+    def _seed_method_sweep_targets() -> List[tuple[int, str, bool]]:
+        seeds: List[tuple[int, str, bool]] = []
+        seen_seed_urls = set()
+
+        def _add(score: int, url: str, *, force_patch: bool = False) -> None:
+            normalized = normalize_url_for_dedup(str(url or "").strip())
+            if not normalized or normalized in seen_seed_urls:
+                return
+            seen_seed_urls.add(normalized)
+            seeds.append((score, normalized, force_patch))
+
+        for ep in authenticated_endpoints or []:
+            if not isinstance(ep, dict):
+                continue
+            raw_url = str(ep.get("url") or "").strip()
+            if not raw_url:
+                continue
+            parts = urlsplit(raw_url)
+            root = urlunsplit((parts.scheme, parts.netloc, "/", "", ""))
+            path = re.sub(r"/+", "/", parts.path or "/")
+            segments = [segment for segment in path.split("/") if segment]
+            lower_path = path.lower()
+
+            _add(18, root, force_patch=html_breadth_profile or spa_method_profile)
+
+            if not segments:
+                continue
+
+            first = segments[0].lower()
+            if first in {"admin", "common", "api", "rest"}:
+                _add(34 if first in {"admin", "common"} else 28, urlunsplit((parts.scheme, parts.netloc, f"/{segments[0]}", "", "")), force_patch=True)
+
+            if len(segments) >= 2 and first in {"admin", "common", "api", "rest"}:
+                second_level = urlunsplit((parts.scheme, parts.netloc, f"/{segments[0]}/{segments[1]}", "", ""))
+                second_score = 42 if first == "admin" else (36 if first == "common" else 30)
+                _add(second_score, second_level, force_patch=True)
+
+            if html_breadth_profile and is_meaningful_html_path(lower_path):
+                _add(44, urlunsplit((parts.scheme, parts.netloc, path, "", "")), force_patch=True)
+
+            if spa_method_profile:
+                for fallback_url in _fallback_high_value_parent_urls(raw_url):
+                    _add(52, fallback_url, force_patch=True)
+
+        return seeds
+
+    ranked: List[tuple[int, str, bool]] = []
     seen_urls = set()
     for ep in authenticated_endpoints or []:
         if not isinstance(ep, dict):
@@ -1096,11 +1166,23 @@ def build_authenticated_high_value_method_probe_plan(
             score += 18
         elif path.rstrip("/") == "/admin":
             score += 30
+        elif path.rstrip("/") == "/common":
+            score += 22
         elif "/admin/" in path:
             score += 20
+        elif "/common/" in path and html_breadth_profile:
+            score += 16
+        if html_breadth_profile and is_meaningful_html_path(path):
+            score += 24
         elif any(tok in path for tok in ("/api/", "/rest/")):
             score += 10
-        ranked.append((score, url))
+        force_patch = bool(
+            "/admin" in path
+            or "/admission" in path
+            or "/acadmgmt" in path
+            or (html_breadth_profile and is_meaningful_html_path(path))
+        )
+        ranked.append((score, url, force_patch))
 
         for fallback_url in _fallback_high_value_parent_urls(url):
             if fallback_url in seen_urls:
@@ -1114,14 +1196,26 @@ def build_authenticated_high_value_method_probe_plan(
                 fallback_score += 25
             if _normalize_replay_key(fallback_url) not in anonymous_norm_paths:
                 fallback_score += 10
-            ranked.append((fallback_score, fallback_url))
+            ranked.append((fallback_score, fallback_url, True))
 
-    ranked.sort(key=lambda item: (-item[0], len(urlsplit(item[1]).path or "/"), item[1]))
+    ranked.extend(_seed_method_sweep_targets())
+
+    dedup_ranked: List[tuple[int, str, bool]] = []
+    best_by_norm: Dict[str, tuple[int, str, bool]] = {}
+    for item in ranked:
+        score, url, force_patch = item
+        norm = _normalize_replay_key(url)
+        existing = best_by_norm.get(norm)
+        if existing is None or score > existing[0] or (score == existing[0] and force_patch and not existing[2]):
+            best_by_norm[norm] = item
+    dedup_ranked.extend(best_by_norm.values())
+
+    ranked = sorted(dedup_ranked, key=lambda item: (-item[0], len(urlsplit(item[1]).path or "/"), item[1]))
 
     target_count = 0
-    for priority, url in ranked:
+    for priority, url, force_patch in ranked:
         replay_key = _normalize_replay_key(url)
-        method_specs = _risky_method_specs(url, headers)
+        method_specs = _auth_method_specs_for_target(url, force_patch=force_patch)
         added_for_target = False
         for spec in method_specs:
             if spec.method not in {"OPTIONS", "PROPFIND", "PATCH"}:
