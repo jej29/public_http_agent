@@ -443,6 +443,45 @@ def _priority_static_bundle_urls(
     return [url for _, _, _, url in sorted(candidates)[:max_keep]]
 
 
+def _priority_meaningful_html_urls(
+    endpoint_map: Dict[str, Dict[str, Any]],
+    *,
+    profile: str,
+) -> List[str]:
+    candidates: List[tuple[int, int, int, str]] = []
+    max_keep = int(
+        os.getenv(
+            "PRIORITY_HTML_ENDPOINTS",
+            "8" if is_html_breadth_profile(profile) else "3",
+        )
+    )
+    if max_keep <= 0:
+        return []
+
+    for url, endpoint in (endpoint_map or {}).items():
+        path = (urlsplit(url).path or "/").lower()
+        score = int(endpoint.get("score", 0) or 0) if isinstance(endpoint, dict) else 0
+        depth = int(endpoint.get("depth", 9999) or 9999) if isinstance(endpoint, dict) else 9999
+        kind = endpoint_kind(endpoint)
+
+        priority = 0
+        if is_meaningful_html_path(path):
+            priority += 12
+        if path.endswith((".html", ".htm")) and "/common/" in path:
+            priority += 8
+        if any(token in path for token in ("/portal/", "nda", "privacy", "policy", "notice")):
+            priority += 6
+        if kind == "form":
+            priority += 2
+
+        if priority <= 0:
+            continue
+        candidates.append((priority, score, -depth, url))
+
+    candidates.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
+    return [url for _, _, _, url in candidates[:max_keep]]
+
+
 def prune_discovered_endpoints(urls: List[str], max_endpoints: int = 30) -> List[str]:
     profile = resolve_scan_profile()
     unique_urls: List[str] = []
@@ -652,11 +691,19 @@ def prepare_discovered_endpoints(
         discovered_endpoint_map,
         profile=profile,
     )
+    preferred_meaningful_html_urls = _priority_meaningful_html_urls(
+        discovered_endpoint_map,
+        profile=profile,
+    )
 
     pruned_urls = prune_discovered_endpoints(
         list(discovered_endpoint_map.keys()),
         max_endpoints=max_endpoints,
     )
+    for html_url in reversed(preferred_meaningful_html_urls):
+        if html_url in pruned_urls:
+            continue
+        pruned_urls.insert(0, html_url)
     for bundle_url in reversed(preferred_static_bundle_urls):
         if bundle_url in pruned_urls:
             continue
@@ -666,7 +713,7 @@ def prepare_discovered_endpoints(
             continue
         pruned_urls.insert(0, seed)
     if len(pruned_urls) > max_endpoints:
-        keep = set(explicit_seed_urls) | set(preferred_static_bundle_urls)
+        keep = set(explicit_seed_urls) | set(preferred_static_bundle_urls) | set(preferred_meaningful_html_urls)
         trimmed: List[str] = []
         for url in pruned_urls:
             if len(trimmed) >= max_endpoints:
@@ -677,7 +724,7 @@ def prepare_discovered_endpoints(
     if target not in pruned_urls:
         pruned_urls = [target] + pruned_urls
     if len(pruned_urls) > max_endpoints:
-        must_keep = {target, *explicit_seed_urls, *preferred_static_bundle_urls}
+        must_keep = {target, *explicit_seed_urls, *preferred_static_bundle_urls, *preferred_meaningful_html_urls}
         trimmed: List[str] = []
         for url in pruned_urls:
             if url in trimmed:
