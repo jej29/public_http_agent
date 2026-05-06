@@ -135,6 +135,7 @@ def has_strong_error_disclosure(candidate: Dict[str, Any]) -> bool:
 
 def has_strong_system_info(candidate: Dict[str, Any]) -> bool:
     evidence = evidence_dict(candidate)
+    subtype = str(candidate.get("subtype") or "")
     strong_versions = evidence.get("strong_version_tokens_in_body") or []
     banner_headers = evidence.get("banner_headers") or {}
     framework_hints = evidence.get("framework_hints") or []
@@ -143,6 +144,7 @@ def has_strong_system_info(candidate: Dict[str, Any]) -> bool:
     setup_diagnostic_values = evidence.get("setup_diagnostic_values") or []
     writable_paths = evidence.get("writable_paths") or []
     file_paths = evidence.get("file_paths") or []
+    response_kind = str(evidence.get("response_kind") or "").lower()
 
     if strong_versions or banner_headers:
         return True
@@ -151,6 +153,10 @@ def has_strong_system_info(candidate: Dict[str, Any]) -> bool:
     if writable_paths:
         return True
     if setup_diagnostic_values and file_paths:
+        return True
+    if internal_ips and response_kind in {"html", "json", "text"}:
+        return True
+    if internal_ips and subtype == "detector_internal_ip":
         return True
     return bool(internal_ips and (strong_versions or banner_headers))
 

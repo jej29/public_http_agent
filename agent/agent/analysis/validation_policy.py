@@ -241,6 +241,10 @@ def _has_concrete_system_info(candidate: Dict[str, Any]) -> bool:
     # internal IP??debug/error context媛 媛숈씠 ?덉쓣 ?뚮쭔 concrete
     if internal_ips and (framework_hints or debug_hints or stack_traces or db_errors or file_paths):
         return True
+    if internal_ips and response_kind in {"html", "json", "text"}:
+        return True
+    if internal_ips and subtype == "detector_internal_ip":
+        return True
 
     # 媛뺥븳 ?쒗뭹/?꾨젅?꾩썙??諛곕꼫 留덉빱
     strong_body_markers = [
