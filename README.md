@@ -1,242 +1,360 @@
-# public_http_agent
+﻿# public_http_agent
 
-`public_http_agent` is an HTTP-focused DAST agent for finding information disclosure and security misconfiguration issues through live requests, response comparison, and lightweight replay verification.
+`public_http_agent`는 웹 애플리케이션의 정보 노출과 보안 설정 오류를 찾기 위한 HTTP 중심 DAST 에이전트입니다.
 
-The scanner is designed around a simple principle:
+이 스캐너는 다음 원칙을 중심으로 설계되어 있습니다.
 
-- collect as many meaningful HTTP observations as possible
-- convert them into structured features
-- classify them with rule-based detectors
-- reduce noise with validation, replay, and deduplication
-- report only findings that have readable evidence
+- 의미 있는 HTTP 관찰 결과를 최대한 많이 수집한다.
+- 수집한 관찰 결과를 구조화된 feature로 변환한다.
+- 먼저 결정론적인 룰 기반 로직으로 분류한다.
+- replay, validation, deduplication으로 노이즈를 줄인다.
+- LLM은 주 탐지 엔진이 아니라 보조 레이어로만 사용한다.
 
-This document explains how the scanner works so that someone new to the project can understand the code flow, target discovery strategy, finding logic, false-positive controls, and where rule-based logic and LLM review fit in.
+이 문서는 현재 코드 기준으로 다음 내용을 설명합니다.
 
-## Goals
+- 크롤링이 어떻게 동작하는지
+- 요청 계획을 어떻게 세우는지
+- 룰 기반 탐지가 무엇을 찾는지
+- LLM이 어디에서 개입하는지
+- finding이 어떻게 검증, 병합, 저장되는지
 
-The current scanner is strongest at:
+## 1. 이 스캐너가 잘하는 영역
 
-- information disclosure over HTTP
-  - verbose error pages
-  - phpinfo exposure
-  - configuration and backup file exposure
-  - directory listing
-  - system and environment detail leakage
-  - authenticated-only differential disclosure
-- security misconfiguration
-  - missing security headers
-  - cookie attribute weaknesses
-  - insecure transport behavior
-  - risky HTTP methods
+현재 스캐너가 상대적으로 강한 영역은 다음과 같습니다.
 
-The scanner works best when at least one authenticated account is available. For disclosure analysis, the long-term model is:
+- 정보 노출
+  - 상세 에러 메시지
+  - 스택 트레이스
+  - 데이터베이스 에러 노출
+  - 내부 IP 노출
+  - 프레임워크 및 버전 정보 노출
+  - `phpinfo` 페이지 노출
+  - 설정 파일, 백업 파일, 로그 파일 노출
+  - 디렉터리 리스팅
+  - 인증 후에만 보이는 차등 정보 노출
+- 보안 설정 오류
+  - 보안 헤더 누락
+  - 취약한 쿠키 속성
+  - 안전하지 않은 전송 보안 동작
+  - 일부 위험 HTTP 메서드 노출
 
-- anonymous vs authenticated
-- authenticated user vs admin
+이 도구는 브라우저 자동화 프레임워크보다는 HTTP 증거 기반 탐지에 더 초점을 둡니다. 목표는 원시 HTTP 증거로부터 재현 가능한 finding을 만드는 것입니다.
 
-That differential view lets us answer not only "is information exposed?" but also "who can see it?"
+## 2. 주요 진입점
 
-## Entry Points
-
-Main entry points:
+주요 런타임 흐름은 다음 파일에서 시작합니다.
 
 - [agent/agent/__main__.py](agent/agent/__main__.py)
 - [agent/agent/runtime/scan_runtime.py](agent/agent/runtime/scan_runtime.py)
 - [agent/agent/runtime/scan_engine.py](agent/agent/runtime/scan_engine.py)
 
-High-level flow:
+고수준 실행 흐름은 아래와 같습니다.
 
-1. Parse CLI arguments.
-2. Prepare output directories and runtime options.
-3. Discover endpoints with anonymous crawling.
-4. Authenticate if credentials or manual auth context are provided.
-5. Build probe plans for baseline, mutations, resource checks, and authenticated business probes.
-6. Execute requests and save raw captures.
-7. Extract features from responses.
-8. Build rule-based signals.
-9. Convert signals into candidate findings.
-10. Validate, verify, merge, deduplicate, and serialize findings.
-11. Generate `results.json`, debug artifacts, and reports.
+1. CLI 인자와 환경변수를 파싱한다.
+2. `out/<target>/<run_id>/` 아래 실행 디렉터리를 만든다.
+3. 익명 상태로 엔드포인트를 탐색한다.
+4. 자격 증명 또는 수동 세션 정보가 있으면 인증 상태를 구성한다.
+5. 인증 상태에서 추가 탐색과 authenticated business probe를 수행한다.
+6. 발견한 엔드포인트로 static request plan을 만든다.
+7. 계획된 요청을 실행하고 raw 캡처를 저장한다.
+8. 응답으로부터 feature를 추출한다.
+9. 룰 기반 signal을 생성한다.
+10. signal을 candidate finding으로 변환한다.
+11. validation, verification, merge를 거쳐 최종 finding으로 정리한다.
+12. `results.json`, `raw/`, `findings/`, `debug/`, `live/`, `report/`를 생성한다.
 
-## Output Layout
+## 3. 출력 구조
 
-Results are written under:
+각 스캔 결과는 기본적으로 아래 경로에 저장됩니다.
 
 - `out/<target-name>/<run_id>/`
 
-Important subdirectories:
+중요한 하위 디렉터리는 다음과 같습니다.
 
 - `raw/`
-  - one JSON file per executed request/response
+  - 실행된 각 요청의 JSON 원본
 - `findings/confirmed/`
 - `findings/informational/`
 - `findings/false_positive/`
 - `debug/`
-  - candidate signal dumps and debug material
+  - candidate signal과 디버깅용 중간 산출물
+- `live/`
+  - 진행 중 증분 업데이트되는 finding stream
 - `report/`
-  - summarized report outputs
+  - 요약 보고서
 
-`run_id` is timestamp-based, so each scan gets its own folder.
+`results.json`의 주요 최상위 키는 아래와 같습니다.
 
-## Crawl And Target Collection
+- `metadata`
+- `raw_index`
+- `findings_confirmed`
+- `findings_informational`
+- `findings_false_positive`
+- `candidate_signals`
+- `scan_diagnostics`
 
-Primary crawler:
+## 4. 크롤링과 엔드포인트 탐색
+
+주요 크롤러:
 
 - [agent/agent/crawler.py](agent/agent/crawler.py)
 
-Discovery is not a full browser crawl. It is an HTTP-first crawl that focuses on extracting useful routes and inputs quickly.
+이 크롤러는 완전한 브라우저 크롤러가 아닙니다. 유용한 URL과 입력점을 빠르게 찾기 위한 HTTP 우선형 라우트 수집기입니다.
 
-Discovery sources:
+### 4.1 익명 탐색
 
-- anchor and form actions from HTML
-- script and body text URLs
-- redirect targets
-- route-like strings inside JavaScript, JSON, XML, and text-like bodies
-- known seed paths such as `robots.txt`, API roots, and common app entry pages
+스캐너는 항상 익명 상태에서 탐색을 시작합니다.
 
-Each discovered endpoint is tagged with metadata such as:
+탐색 입력:
 
-- endpoint kind
-  - page, form, static asset, API-like, document-like
-- endpoint score
-  - estimated usefulness for probing
-- discovered input names
-  - query parameters, form field names
-- states
-  - anonymous, authenticated, or both
+- 기본 `--target`
+- 선택적인 `--seed-url`
+- `_spa_seed_urls()`로 확장되는 공통 seed
 
-The runtime uses that metadata to decide which probes are worth sending and which low-value paths can be pruned.
+크롤러는 다음 위치에서 라우트를 추출합니다.
 
-## Probe Planning
+- anchor 태그
+- form action
+- script와 link 태그
+- redirect target
+- JavaScript, JSON, XML, text 응답 안의 route-like 문자열
+- query string 이름
+- form field 이름
 
-Planner modules:
+각 엔드포인트에는 다음과 같은 메타데이터가 붙습니다.
 
-- [agent/agent/planning/probes.py](agent/agent/planning/probes.py)
-- [agent/agent/planning/llm_probe_planner.py](agent/agent/planning/llm_probe_planner.py)
+- `url`
+- `kind`
+  - `page`, `form`, `asset_js`, `static` 등
+- `score`
+- `field_names`
+- `query_param_names`
+- `states`
+  - `anonymous`, `authenticated`, 또는 둘 다
 
-Every request is represented as a `RequestSpec` carrying:
+### 4.2 인증 후 탐색
 
-- URL
-- method
-- headers
-- body
-- auth state
-- probe family
-- mutation class
-- expected signal
-- comparison group
+인증이 성립하면 인증된 세션으로 두 번째 탐색을 수행합니다.
 
-Important probe families:
-
-- baseline probes
-  - plain GET, HEAD, and follow-redirect observations
-- comparison probes
-  - not-found mutations
-  - benign query mutations
-  - path encodings
-- resource exposure probes
-  - config files
-  - backups
-  - logs
-  - phpinfo/debug/default resources
-- directory behavior probes
-  - folder routes and index behavior
-- header behavior probes
-  - forwarded and proxy-related variations
-- authenticated business probes
-  - pages only visible or reachable after login
-- replay probes
-  - differential anonymous vs authenticated re-requests
-
-The planner is intentionally comparative. Many findings come from the difference between:
-
-- baseline vs mutated request
-- anonymous vs authenticated request
-- normal page vs verbose/debug path
-
-## Authentication Model
-
-Authentication helpers:
+관련 모듈:
 
 - [agent/agent/runtime/auth_runtime.py](agent/agent/runtime/auth_runtime.py)
-- [agent/agent/runtime/scan_engine.py](agent/agent/runtime/scan_engine.py)
+- [agent/agent/runtime/scan_runtime.py](agent/agent/runtime/scan_runtime.py)
 
-Supported modes:
+이 단계가 중요한 이유는 다음과 같습니다.
 
-- form login using `--auth-username` and `--auth-password`
-- manual session reuse using supplied cookies and headers
+- 익명 크롤링만으로는 business page나 내부 API를 놓치기 쉽다.
+- 인증 후 크롤링에서 추가 라우트가 드러난다.
+- 차등 정보 노출 탐지를 위해 익명/인증 응답 쌍이 필요하다.
 
-Why authentication matters:
+인증된 엔드포인트는 다음에서 수집됩니다.
 
-- authenticated crawling exposes additional routes
-- cookie findings such as `HttpOnly` and `SameSite` require observing `Set-Cookie`
-- differential disclosure needs both anonymous and authenticated observations
+- 인증 후 재크롤링 결과
+- 인증 landing page 문맥
+- 로그인 처리 중 수집된 auth snapshot
 
-### Auth State Loss Detection
+### 4.3 앱 스코프 제한
 
-The runtime keeps track of whether an authenticated scope appears to have fallen back to:
+스캐너는 같은 origin의 모든 URL을 무한정 요청하지 않습니다. 아래 로직으로 앱 스코프를 좁힙니다.
 
-- login page
-- external SSO redirect
-- session expired response
+- `derive_allowed_app_prefixes()`
+- `filter_endpoints_by_app_scope()`
+- `filter_request_specs_by_app_scope()`
 
-This is recorded in `results.json` as `auth_state_loss_count` and examples.
+스코프는 주로 다음을 기준으로 결정됩니다.
 
-Recent tuning goal:
+- target
+- authenticated landing URL
+- seed URL
 
-- reduce false positives on authenticated business pages that contain words like `login`, `password`, or `portal` for legitimate reasons
+SPA 대상에는 중요한 예외가 있습니다.
 
-Current logic now prefers stronger auth-loss evidence such as:
+- 인증 shell이 `/admin` 아래에 있고
+- 실제 JavaScript bundle이 `/static/js/...`에서 제공되는 경우
 
-- real login-like UI
-- auth redirect behavior
-- 401 or 407 responses
-- explicit session-expired markers
+same-origin JS bundle은 scope 안에 남겨서 client bundle disclosure 검사가 pruning으로 사라지지 않도록 합니다.
 
-It avoids treating every page with a password field as a login page.
+### 4.4 Scan Profile
 
-## Feature Extraction
+스캔 성향은 아래 파일에서 조정됩니다.
 
-Main feature extractor:
+- [agent/agent/runtime/scan_profile.py](agent/agent/runtime/scan_profile.py)
+
+지원 프로파일:
+
+- `balanced`
+  - 일반 기본값
+- `spa_auth_heavy`
+  - SSIT처럼 인증 의존도가 높은 SPA/API 타깃에 적합
+- `server_html_broad`
+  - NDA처럼 HTML breadth가 중요한 타깃에 적합
+
+프로파일은 다음에 영향을 줍니다.
+
+- endpoint bucket 제한
+- pruning 동작
+- JS bundle 보존 정도
+- 어떤 경로를 method-heavy 타깃으로 볼지
+
+## 5. 요청 계획
+
+주요 planner:
+
+- [agent/agent/planning/probes.py](agent/agent/planning/probes.py)
+
+각 요청은 `RequestSpec`으로 표현됩니다.
+
+중요한 `RequestSpec` 필드:
+
+- `name`
+- `method`
+- `url`
+- `headers`
+- `body`
+- `family`
+- `mutation_class`
+- `auth_state`
+- `replay_key`
+- `expected_signal`
+- `comparison_group`
+
+### 5.1 Static Plan
+
+Static probe 계획은 두 단계로 만들어집니다.
+
+1. `prepare_discovered_endpoints()`가 pruning된 엔드포인트 목록을 만든다.
+2. `_build_static_plan_from_endpoints()`가 probe intensity를 정하고 `build_probe_plan()`을 호출한다.
+
+대표 intensity:
+
+- `static`
+- `light`
+- `medium`
+- `full`
+
+강도는 다음에 따라 달라집니다.
+
+- endpoint score
+- path 형태
+- endpoint kind
+- scan profile
+
+### 5.2 주요 probe family
+
+스캐너는 단순 GET만 보내지 않습니다. 비교 가능한 여러 family를 사용합니다.
+
+- `baseline`
+  - `baseline_get`
+  - `baseline_query_session`
+  - `baseline_follow_get`
+- `comparison`
+  - not-found path mutation
+  - benign query mutation
+  - path encoding variation
+- `default_resource`
+  - config, backup, log, debug, `phpinfo` probe
+- `directory_behavior`
+  - directory listing 점검
+- `header_behavior`
+  - `X-Forwarded-*`, `Forwarded` variation
+- `method_behavior`
+  - `OPTIONS`, `PROPFIND`, `PATCH` 등
+- `authenticated_business_probe`
+  - 인증된 business route에 대한 GET
+
+많은 finding은 아래 비교에서 나옵니다.
+
+- baseline vs mutated request
+- anonymous vs authenticated response
+- 일반 페이지 vs resource/debug/error path
+
+## 6. 인증 모델
+
+인증은 두 가지 주요 방식을 지원합니다.
+
+- 폼 로그인
+  - `--auth-username`
+  - `--auth-password`
+- 수동 인증 세션 재사용
+  - `MANUAL_AUTH_COOKIE`
+  - `MANUAL_AUTH_HEADERS`
+
+관련 파일:
+
+- [agent/agent/runtime/auth_runtime.py](agent/agent/runtime/auth_runtime.py)
+- [agent/agent/runtime/manual_auth.py](agent/agent/runtime/manual_auth.py)
+
+### 6.1 수동 인증 헤더 형식
+
+`MANUAL_AUTH_HEADERS`는 현재 아래 구분자를 지원합니다.
+
+- `|||`
+- `||`
+- 줄바꿈
+
+예시:
+
+```bash
+-e MANUAL_AUTH_HEADERS=$'Authorization: Bearer ...|||Origin: http://host|||Referer: http://host/'
+```
+
+### 6.2 인증 상태 손실 감지
+
+인증된 스캔 중 세션이 사실상 아래 상태로 돌아갔는지 감지합니다.
+
+- 로그인 페이지
+- 외부 SSO redirect
+- session-expired response
+- 401, 403, 407 같은 강한 auth-required 신호
+
+현재 로직은 보수적으로 동작합니다. `login`, `password` 같은 단어만 있다고 바로 auth-loss로 보지 않도록 설계되어 있습니다.
+
+## 7. Feature Extraction
+
+주요 feature 추출은 아래 파일에서 수행됩니다.
 
 - [agent/agent/analysis/features.py](agent/agent/analysis/features.py)
 
-`extract_features()` converts a raw response into structured signals such as:
+이 단계는 raw HTTP 응답을 구조화된 관찰값으로 바꿉니다.
 
-- status code and redirect info
-- content type and body class
-- banner headers
-- cookie observations
-- runtime error strings
-- file paths
-- internal IPs
-- phpinfo values
-- config-style key/value pairs
-- directory listing hints
-- default resource hints
-- auth-required, session-expired, and external-auth indicators
+대표 feature:
 
-Important distinction:
+- status code와 redirect 정보
+- content type과 response kind
+- banner header
+- cookie 관찰값
+- allowed methods
+- stack trace
+- file path
+- internal IP
+- DB error
+- runtime error
+- framework hint
+- debug hint
+- directory listing hint
+- default file hint
+- `phpinfo` indicator/value
+- config-style key/value
+- auth/session loss indicator
 
-- features are observations
-- they are not findings yet
+이 단계는 아직 finding 단계가 아닙니다. 스캐너는 의도적으로 아래를 분리합니다.
 
-This separation lets the scanner keep broad visibility without reporting everything as a vulnerability.
+- 무엇을 관찰했는가
+- 무엇을 보고해야 하는가
 
-## Rule-Based Classification
+## 8. 룰 기반 탐지
 
-Main signal builder:
+HTTP signal builder는 주로 아래 파일에 있습니다.
 
-- [agent/agent/http/classifier.py](agent/agent/http/classifier.py)
-
-Sub-classifiers:
-
+- [agent/agent/http/http_signal_builder.py](agent/agent/http/http_signal_builder.py)
 - [agent/agent/http/http_policy_classifier.py](agent/agent/http/http_policy_classifier.py)
 - [agent/agent/http/http_disclosure_classifier.py](agent/agent/http/http_disclosure_classifier.py)
 - [agent/agent/http/http_resource_classifier.py](agent/agent/http/http_resource_classifier.py)
 - [agent/agent/http/disclosure_enrichment.py](agent/agent/http/disclosure_enrichment.py)
 
-These modules turn features into typed signals such as:
+이 모듈들은 feature를 rule-based signal로 바꿉니다.
+
+대표 finding type:
 
 - `HTTP_ERROR_INFO_EXPOSURE`
 - `HTTP_SYSTEM_INFO_EXPOSURE`
@@ -245,231 +363,267 @@ These modules turn features into typed signals such as:
 - `DIRECTORY_LISTING_ENABLED`
 - `COOKIE_HTTPONLY_MISSING`
 - `COOKIE_SECURE_MISSING`
-- `DIRECT_COOKIE_SAMESITE_MISSING`
+- `COOKIE_SAMESITE_MISSING`
+- `CLICKJACKING`
+- `HSTS_MISSING`
+- `CONTENT_TYPE_SNIFFING`
 
-Signals are still intermediate. They become findings only after candidate generation, validation, and merge.
+### 8.1 탐지 기준을 이해하는 순서
 
-## Candidate Generation, Validation, And Verification
+코드를 이해할 때는 대략 아래 순서로 보면 편합니다.
 
-Main modules:
+1. 응답 정책 문제
+   - 보안 헤더 누락
+   - 약한 cookie 속성
+   - transport/security policy 문제
+2. 직접적인 HTTP 노출
+   - config file
+   - `phpinfo`
+   - directory listing
+   - setup/debug/default resource
+3. body 기반 정보 노출
+   - internal IP
+   - stack trace
+   - DB error
+   - framework/version/runtime detail
+4. 비교 기반 차등 노출
+   - anonymous vs authenticated
+   - baseline vs mutation
+
+### 8.2 예시
+
+- `HTTP_ERROR_INFO_EXPOSURE`
+  - stack trace, SQL error, constraint name, local file path
+- `HTTP_SYSTEM_INFO_EXPOSURE`
+  - internal IP, framework hint, server header, runtime detail
+- `HTTP_CONFIG_FILE_EXPOSURE`
+  - 외부 접근 가능한 config/backup file
+- `DIRECTORY_LISTING_ENABLED`
+  - deterministic한 directory index 노출
+- `RISKY_HTTP_METHODS_ENABLED`
+  - 민감 메서드가 허용되거나 실제 동작하는 증거
+
+## 9. Candidate 생성, Validation, Verification
+
+Signal은 아직 최종 finding이 아닙니다.
+
+관련 모듈:
 
 - [agent/agent/candidates.py](agent/agent/candidates.py)
+- [agent/agent/runtime/candidate_verifier.py](agent/agent/runtime/candidate_verifier.py)
+- [agent/agent/runtime/candidate_finalizer.py](agent/agent/runtime/candidate_finalizer.py)
 - [agent/agent/analysis/verification_policy.py](agent/agent/analysis/verification_policy.py)
+- [agent/agent/analysis/validation_policy.py](agent/agent/analysis/validation_policy.py)
 - [agent/agent/findings/store.py](agent/agent/findings/store.py)
-- [agent/agent/findings/identity.py](agent/agent/findings/identity.py)
 
-### Candidate Generation
+### 9.1 Candidate Generation
 
-`generate_candidates()` groups signals and creates finding-shaped records with:
+Candidate finding은 대체로 아래 정보를 가집니다.
 
-- type
-- title
-- CWE and OWASP mapping
-- severity
-- evidence
-- extracted information
+- `type`
+- `title`
+- `severity`
+- `cwe`
+- `owasp`
+- `evidence`
+- `verification_strategy`
+- `exposed_information`
 
-### Validation
+### 9.2 Validation
 
-Validation removes or downgrades weak findings such as:
+Validation 단계는 약하거나 오해의 소지가 있는 candidate를 제거하거나 informational로 낮춥니다.
 
-- keyword-only matches without a disclosed value
-- broken binary text misread as a path
-- generic `Fatal error` strings without meaningful details
-- source markers like `<?php` without actual source/code disclosure
+대표 사례:
 
-### Verification
+- keyword만 있는 generic match
+- binary garbage를 file path로 잘못 읽은 경우
+- 의미 있는 노출 없이 source marker만 있는 경우
+- 가치가 낮은 약한 system-info 신호
 
-Where practical, the scanner verifies behavior by replaying or comparing requests. Examples:
+### 9.3 Verification
 
-- authenticated vs anonymous response comparison
-- resource exposure re-checks
-- directory listing confirmation
-- method handling confirmation
+Verification은 finding 종류에 따라 다르게 수행됩니다.
 
-## Differential Disclosure
+예:
 
-One of the most important improvements is anonymous vs authenticated replay for information disclosure.
+- deterministic single-observation confirmation
+- rule-based detector confirmation
+- repeated reproduction
+- differential replay
+- method verification
+  - PUT upload retrieval check
+  - DELETE 이후 absence verification
 
-Logic lives mainly in:
+최종 finding에는 다음이 붙습니다.
+
+- `verification.verdict`
+- `verification.reason`
+
+## 10. Differential Disclosure
+
+차등 정보 노출 로직은 주로 아래 파일에 있습니다.
 
 - [agent/agent/runtime/scan_results.py](agent/agent/runtime/scan_results.py)
+- [agent/agent/runtime/scan_runtime.py](agent/agent/runtime/scan_runtime.py)
 
-Workflow:
+동작 순서:
 
-1. Scan normally with authentication.
-2. Re-request disclosure-related routes anonymously.
-3. Extract structured disclosure values from both responses.
-4. Compare `authenticated_values - anonymous_values`.
-5. If authenticated-only values appear, mark the finding accordingly.
+1. 인증된 세션으로 먼저 스캔한다.
+2. 정보 노출과 관련된 route를 anonymous client로 다시 요청한다.
+3. 양쪽 응답에서 구조화된 disclosure value를 추출한다.
+4. `authenticated_values - anonymous_values`를 계산한다.
+5. 인증 후에만 의미 있는 값이 생기면 differential finding을 만든다.
 
-This allows findings such as:
+현재 differential extraction이 보는 값 예시는 다음과 같습니다.
 
-- public disclosure
-- authenticated-only disclosure
-- authenticated-observed-only disclosure
+- `phpinfo` 데이터
+- config key/value
+- runtime error
+- local file path
+- internal IP
+- 민감 사용자 필드
+  - email
+  - phone
+  - login IP
+  - last login
+  - employee ID
+  - department
+  - role
+  - position
+  - password-hash 또는 encrypted-password metadata
 
-### Visibility Fields
+중요한 differential subtype:
 
-Relevant findings now carry:
+- `authenticated_phpinfo_disclosure`
+- `authenticated_config_disclosure`
+- `authenticated_profile_disclosure`
+- `authenticated_credential_metadata_disclosure`
+- `authenticated_diagnostic_disclosure`
 
-- `visibility_scope`
-  - `public_or_shared`
-  - `authenticated_only`
-  - `authenticated_observed_only`
-  - `unknown`
-- `exposure_context`
-  - `public_or_shared`
-  - `authenticated`
-  - `differential_anonymous_vs_authenticated`
+## 11. False Positive 제어
 
-These fields are meant to prevent overclaiming. A finding seen only with a valid session should not be described the same way as a public exposure.
+노이즈 감소는 여러 단계에 나뉘어 있습니다. 한 군데에서 크게 필터링하지 않습니다.
 
-## False-Positive Control
+### 11.1 Discovery Pruning
 
-The scanner is intentionally layered. Noise is reduced in several places instead of one giant filter.
+- low-value endpoint는 우선순위를 낮추거나 제거
+- session-destructive route는 제외
+- static asset 비중 제한
 
-### 1. Discovery pruning
+### 11.2 Feature Sanitization
 
-Low-value routes are deprioritized or skipped.
+- path처럼 보이는 노이즈 정리
+- 가치 낮은 internal IP match 필터링
+- binary/garbled text가 evidence가 되지 않도록 방지
 
-Examples:
+### 11.3 Classifier Threshold
 
-- static assets
-- documentation-like pages
-- destructive logout routes
+- source marker만으로는 바로 finding이 되지 않음
+- 약한 DB error는 meaningful detail이 없으면 suppress
+- generic auth-loss wording만으로는 세션 만료로 보지 않음
 
-### 2. Feature sanitization
+### 11.4 Merge And Dedupe
 
-Examples:
+Stable identity key를 사용해 반복 관찰을 병합합니다.
 
-- binary garbage is rejected as a file path
-- heavily masked values are not reported as leaked secrets
-- trivial tokens such as `array (` are dropped
+예:
 
-### 3. Classifier thresholds
+- host-wide banner finding
+- canonical URL normalization
+- 같은 route의 반복 disclosure
 
-Examples:
+현재 merge 로직은 internal IP를 포함한 body disclosure finding이 header-only supporting signal보다 우선되도록 보정되어 있습니다.
 
-- generic login-like words are not enough for auth-loss on their own
-- source markers are kept as supporting evidence rather than promoted directly
-- weak DB errors are suppressed unless they contain real detail
+## 12. LLM은 어디에 붙는가
 
-### 4. Merge and dedupe
+의도한 구조는 다음과 같습니다.
 
-Stable identity keys merge repeated observations into one finding.
+- 룰 기반 로직이 재현 가능한 탐지를 담당한다.
+- LLM은 우선순위, 문구, 약한 evidence 정리에 보조적으로 사용된다.
 
-Examples:
+주요 LLM 관련 파일:
 
-- host-wide banner findings
-- canonical URL normalization for synthetic `__nonexistent_*` probes
-- repeated directory index pages
+- [agent/agent/llm_client.py](agent/agent/llm_client.py)
+- [agent/agent/planning/llm_probe_planner.py](agent/agent/planning/llm_probe_planner.py)
+- [agent/agent/reporting/report_generator.py](agent/agent/reporting/report_generator.py)
 
-### 5. Differential replay
+환경변수:
 
-Anonymous replay helps answer whether data is really exposed publicly or only after authentication.
+- `LLM_MODE`
+- `LLM_PROBE_PLANNER_MODE`
+- `LLM_REPORT_MODE`
 
-## CWE Mapping Strategy
+### 12.1 룰 기반이 담당하는 일
 
-The project no longer relies on broad `CWE-200` by default when a more precise mapping is available.
-
-Current preferred mappings:
-
-- `CWE-209`
-  - error messages containing sensitive detail
-- `CWE-497`
-  - system, environment, path, phpinfo, internal address, runtime detail exposure
-- `CWE-538`
-  - externally accessible config files and config-like disclosures
-- `CWE-548`
-  - directory listing enabled
-- `CWE-552`
-  - exposed default or backup resources accessible over HTTP
-
-`CWE-200` should be treated as a fallback umbrella mapping, not the first choice.
-
-## Severity And Source Fields
-
-Final output now uses a single top-level `severity`.
-
-The report also exposes where classification came from:
-
-- `classification_source`
-  - usually `rule_based` or `rule_based_differential`
-- `cwe_source`
-  - usually `rule_based_mapping` or `rule_based_visibility_mapping`
-- `severity_source`
-  - usually `rule_based_policy`, `rule_based_differential_policy`, or `validation_policy`
-
-This makes it clear whether the result came from:
-
-- direct rule logic
-- a differential comparison
-- a later validation downgrade or upgrade
-
-## Rule-Based Logic Vs LLM
-
-The scanner is designed so that rule-based logic does the hard, reproducible work first.
-
-### Rule-based responsibilities
-
-- crawling
-- probe generation
-- response parsing
+- 크롤링
+- 요청 계획
+- 응답 파싱
 - feature extraction
 - deterministic classification
 - replay verification
-- merge and dedupe
-- final structured evidence assembly
+- merge와 dedupe
+- 최종 evidence assembly
 
-### LLM responsibilities
+### 12.2 LLM이 담당하는 일
 
-When enabled, LLM use is intended for:
+활성화된 경우 LLM은 주로 아래 역할을 맡습니다.
 
-- candidate value triage
-- report phrasing
-- weak evidence cleanup
-- future evidence-quality review
+1. evidence review
+   - 약한 disclosure evidence 정리
+   - severity, CWE, finding 문구 보조
+2. 추가 probe planning
+   - midpoint/final 단계에서 추가 `RequestSpec` 제안
+3. report assistance
+   - 사람이 읽기 쉬운 요약 생성 보조
 
-Important note:
+중요한 점:
 
-- the current pipeline is fully capable of operating with LLM disabled
-- CWE mapping and severity are currently rule-based unless explicit LLM review is added
+- LLM이 꺼져 있어도 스캐너는 동작한다.
+- 핵심 탐지 파이프라인은 여전히 룰 기반이다.
 
-## Additional HTTP-Detectable Disclosure CWE Ideas
+## 13. 중요한 런타임 파라미터
 
-Beyond the CWEs already implemented, good future candidates include:
+자주 조정하는 값:
 
-- `CWE-201`
-  - reflected sensitive data in response bodies
-- `CWE-203`
-  - observable discrepancies that reveal valid users, roles, or object existence
-- `CWE-215`
-  - debug information in responses
-- `CWE-526`
-  - environment variable exposure
-- `CWE-537`
-  - Java runtime error messages with sensitive details
-- `CWE-540`
-  - inclusion of sensitive information in source code
-- `CWE-541`
-  - inclusion of sensitive information in include files
-- `CWE-598`
-  - sensitive information in GET query strings
+- `TIMEOUT_SECONDS`
+- `RETRIES`
+- `REQUEST_BUDGET`
+- `MAX_ENDPOINTS`
+- `CRAWL_DEPTH`
+- `CRAWL_MAX_PAGES`
+- `CRAWL_INCLUDE_JS_PATHS`
+- `AUTH_SESSION_BUDGET_SECONDS`
+- `AUTHENTICATED_BUSINESS_PROBE_MAX_TARGETS`
+- `AUTHENTICATED_HIGH_VALUE_METHOD_PROBE_MAX_TARGETS`
+- `SCAN_PROFILE`
+- `PRIORITY_JS_ENDPOINTS`
+- `CLIENT_BUNDLE_PROBE_MAX_TARGETS`
+- `CLIENT_BUNDLE_PROBE_INTENSITY`
 
-These should only be added when there is strong HTTP-observable evidence and a clear false-positive strategy.
+운영 팁:
 
-## How To Read A Finding
+- 인증 의존도가 높은 SPA/API 타깃에는 `SCAN_PROFILE=spa_auth_heavy`
+- HTML breadth가 중요한 타깃에는 `SCAN_PROFILE=server_html_broad`
+- 가능하면 realistic한 `--seed-url`을 제공
+- authenticated business route를 seed에 넣을수록 차등 노출 탐지가 강해짐
 
-A useful finding should answer these questions quickly:
+## 14. 현재 한계
 
-- what was exposed?
-- where was it observed?
-- who could see it?
-- how confident are we?
-- which rule mapped it to this CWE and severity?
+- 완전한 브라우저 런타임을 흉내내지는 못한다.
+- OTP 갱신 같은 복잡한 로그인 갱신 흐름은 제한적이다.
+- 차등 정보 노출은 실제로 도달한 authenticated route 품질에 크게 좌우된다.
+- 엔터프라이즈 타깃에서는 seed URL 품질의 영향이 크다.
 
-The top of the compact finding is intended to answer exactly that through:
+## 15. 실무 사용 팁
+
+내부 시스템 테스트 시 권장 사항:
+
+- 최소 한 개 이상의 실제 authenticated session 제공
+- 실제 business URL을 `--seed-url`로 넣기
+- `profile`, `detail`, `view`, `info`, `member`, `account`, `mypage` 계열 route를 포함하기
+- 가능하면 anonymous와 authenticated 응답을 함께 비교하기
+
+Finding을 볼 때 가장 중요한 필드:
 
 - `type`
 - `title`
@@ -477,36 +631,26 @@ The top of the compact finding is intended to answer exactly that through:
 - `exposure_context`
 - `severity`
 - `cwe`
-- `classification_source`
-- `cwe_source`
-- `severity_source`
+- `verification`
 
-## Current Limitations
+이 필드들이 빠르게 답해주는 질문은 다음과 같습니다.
 
-- Cookie attribute findings depend on actually observing `Set-Cookie`.
-- Some auth-loss heuristics still need tuning on apps with many authenticated forms.
-- Differential visibility is strongest today for anonymous vs authenticated, and can be extended later to user vs admin.
-- LLM-based evidence review is not yet the default path, so weak evidence cleanup is still mostly heuristic.
+- 무엇이 노출되었는가
+- 어디에서 관찰되었는가
+- 누가 볼 수 있는가
+- 증거가 얼마나 강한가
 
-## Practical Guidance For Testing
+## 16. 요약
 
-For realistic scans:
+`public_http_agent`는 단순한 키워드 grep 스크립트가 아닙니다.
 
-- provide at least one working authenticated account
-- keep seed URLs focused on real app entry points
-- test anonymous and authenticated visibility whenever possible
-- prefer local reproducible apps such as DVWA and bWAPP before moving to harder enterprise targets
+이 도구는 다음 파이프라인으로 이해하면 됩니다.
 
-For role-aware disclosure analysis in the future:
+- HTTP 관찰 기반 route discovery
+- 비교 가능한 probe planning
+- 구조화된 feature extraction
+- 룰 기반 classification
+- verification과 deduplication
+- 필요할 때만 LLM을 보조 레이어로 사용
 
-- scan anonymously
-- scan as normal user
-- scan as admin
-- compare which information appears only at each visibility level
-
-That role-differential model is the most reliable way to distinguish:
-
-- public exposure
-- authenticated-only exposure
-- overexposure to regular users
-- admin-only operational detail
+이 조합 덕분에 finding이 읽기 쉽고, 재현 가능하며, 내부 보안 검토에 바로 활용 가능한 형태로 정리됩니다.
